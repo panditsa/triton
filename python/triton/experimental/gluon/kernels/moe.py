@@ -212,29 +212,54 @@ if _GLUON_AVAILABLE:
             operand_index=1, parent=mfma_layout, k_width=MFMA_K_WIDTH
         )
 
+        # Load layout for B in the [BLOCK_N, BLOCK_K] orientation.
+        # Bases are the trans of dot_b_layout's bases (which describe
+        # [BLOCK_K, BLOCK_N]). After loading B into this layout and
+        # calling .trans(1, 0), the result lands in dot_b_layout
+        # trivially (metadata-only convert_layout, no cross-warp moves).
+        # Hand-derived from the compiler's dump of dot_b_layout:
+        #   reg_bases  = [[1, 0], [2, 0], [4, 0], [32, 0], [0, 64]]
+        #   lane_bases = [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0], [16, 0]]
+        #   warp_bases = [[0, 16], [0, 32], [0, 0]]
+        #   shape      = [64, 128]   (K, N)
+        # which transposes for shape [128, 64] (N, K) to:
+        load_b_nk_layout: gl.constexpr = gl.DistributedLinearLayout(
+            reg_bases=[[0, 1], [0, 2], [0, 4], [0, 32], [64, 0]],
+            lane_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 8], [0, 16]],
+            warp_bases=[[16, 0], [32, 0], [0, 0]],
+            block_bases=[],
+            shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+
         # Blocked layouts. size_per_thread[contig] * 16 = 128 bits per
         # buffer_load instruction (the LDS-direct path's strict requirement).
-        # The A layout exactly matches the constraint required by
-        # cdna4_async_copy.buffer_load_to_shared on gfx950.
+        # Both A and B are loaded as [BIG, BLOCK_K] tiles where K (the
+        # HBM-contig dim) lands on dim 1, so order=[1, 0] satisfies the
+        # buffer_load_to_shared lowering. The B tile is therefore labelled
+        # [BLOCK_N, BLOCK_K] in this kernel (transposed from [K, N]); the
+        # transpose back to the MFMA-expected orientation happens on the
+        # LDS read side via tensor.trans + convert_layout.
         blocked_mk: gl.constexpr = gl.BlockedLayout(
             size_per_thread=[1, 8],
             threads_per_warp=[8, 8],
             warps_per_cta=[NUM_WARPS, 1],
             order=[1, 0],
         )
-        blocked_kn: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[8, 1],
+        blocked_nk: gl.constexpr = gl.BlockedLayout(
+            size_per_thread=[1, 8],
             threads_per_warp=[8, 8],
-            warps_per_cta=[1, NUM_WARPS],
-            order=[0, 1],
+            warps_per_cta=[NUM_WARPS, 1],
+            order=[1, 0],
         )
 
         # vec=8 (=k_width) gives bank-conflict-free MFMA reads.
+        # shared_b is [BLOCK_N, BLOCK_K] order=[1, 0] (K contig in LDS) so
+        # the matching buffer_load_to_shared can lower.
         shared_a: gl.constexpr = gl.SwizzledSharedLayout(
             vec=MFMA_K_WIDTH, per_phase=1, max_phase=16, order=[1, 0]
         )
         shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=MFMA_K_WIDTH, per_phase=1, max_phase=16, order=[0, 1]
+            vec=MFMA_K_WIDTH, per_phase=1, max_phase=16, order=[1, 0]
         )
 
         # ---- gather A: per-token row indices, then per-element offsets ----
@@ -285,24 +310,27 @@ if _GLUON_AVAILABLE:
         offs_a_base = offs_a_row[:, None] + offs_ak[None, :] * stride_ak
 
         # ---- B offsets (per-expert; expert is a runtime scalar) ----
-        offs_kB_layout: gl.constexpr = gl.SliceLayout(1, blocked_kn)
-        offs_bn_layout: gl.constexpr = gl.SliceLayout(0, blocked_kn)
+        # The B tile is loaded as [BLOCK_N, BLOCK_K] so the HBM-contig
+        # dim (K) sits on tile dim 1 to satisfy the buffer_load_to_shared
+        # constraint. The transpose back to [K, N] happens on the LDS read.
+        offs_bk_layout: gl.constexpr = gl.SliceLayout(0, blocked_nk)
+        offs_bn_layout: gl.constexpr = gl.SliceLayout(1, blocked_nk)
 
         offs_bn = (
             pid_n * BLOCK_SIZE_N
             + gl.arange(0, BLOCK_SIZE_N, layout=offs_bn_layout)
         ) % N
-        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=offs_kB_layout)
-        offs_b_base = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=offs_bk_layout)
+        offs_b_base = offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk
 
         b_ptr_e = b_ptr + off_experts.to(gl.int64) * stride_be
 
         # ---- shared memory ----
-        # A uses async LDS-direct loads (the gather pattern matches CK).
-        # B uses sync VGPR-staged loads. Both A and B are double-buffered in
-        # LDS so the next iter's smem write can issue while the MFMA still
-        # reads from the previous buffer; wait_group(1) drains the older A.
-        # LDS budget per CTA: 2 * 128 * 64 * 2 (A) + 2 * 64 * 128 * 2 (B)
+        # Both A and B use async LDS-direct loads via buffer_load_to_shared.
+        # Both are double-buffered so the next iter's load can be issued
+        # before the current iter's MFMA reads finish; wait_group(1) drains
+        # the older pair (A and B share the same async commit group).
+        # LDS budget per CTA: 2 * 128 * 64 * 2 (A) + 2 * 128 * 64 * 2 (B)
         # = 32 KiB + 32 KiB = 64 KiB.
         NUM_BUFFERS_A: gl.constexpr = 2
         NUM_BUFFERS_B: gl.constexpr = 2
@@ -313,18 +341,17 @@ if _GLUON_AVAILABLE:
         )
         smem_b = gl.allocate_shared_memory(
             b_ptr.type.element_ty,
-            [NUM_BUFFERS_B, BLOCK_SIZE_K, BLOCK_SIZE_N],
+            [NUM_BUFFERS_B, BLOCK_SIZE_N, BLOCK_SIZE_K],
             shared_b,
         )
 
-        # ---- prologue: issue async A load (buf 0), sync B load to VGPR ----
+        # ---- prologue: async A and B loads into LDS buffer 0 ----
         if even_Ks:
             cdna4_async_copy.buffer_load_to_shared(
                 smem_a.index(0), a_ptr, offs_a_base, mask=token_mask[:, None]
             )
-            b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr_e,
-                offsets=offs_b_base,
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_b.index(0), b_ptr_e, offs_b_base
             )
         else:
             cdna4_async_copy.buffer_load_to_shared(
@@ -333,10 +360,11 @@ if _GLUON_AVAILABLE:
                 offs_a_base,
                 mask=token_mask[:, None] & (offs_ak[None, :] < K),
             )
-            b = gl.amd.cdna4.buffer_load(
-                ptr=b_ptr_e,
-                offsets=offs_b_base,
-                mask=offs_bk[:, None] < K,
+            cdna4_async_copy.buffer_load_to_shared(
+                smem_b.index(0),
+                b_ptr_e,
+                offs_b_base,
+                mask=offs_bk[None, :] < K,
             )
         cdna4_async_copy.commit_group()
 
@@ -348,20 +376,20 @@ if _GLUON_AVAILABLE:
 
         # ---- pipelined K-loop ----
         # Pattern per loop iteration:
-        #   1. Store current B to LDS[cur_b_buf].
-        #   2. Issue async A load for next iter into smem_a[nxt_a_buf]
-        #      and sync B load for next iter to VGPR.
-        #   3. wait_group(1) drains the older A async load.
-        #   4. Read A from smem_a[cur_a_buf] and B from smem_b[cur_b_buf],
-        #      issue the collective MFMA (all 8 warps participate).
-        # The `gl.amd.warp_pipeline_stage` markers are intentionally NOT
-        # used here. The conversion pass that turns those markers into
-        # `s_setprio` runs through a `CondBarrier`-based warp
-        # specialization where each warp group runs different iterations,
-        # which is incompatible with this kernel's collective MFMA across
-        # all 8 warps. The double-buffering on A and B still lets the
-        # backend overlap the next iter's HBM loads with the current
-        # iter's MFMA reads.
+        #   1. Issue async A load for next iter into smem_a[nxt_a_buf]
+        #      and async B load for next iter into smem_b[nxt_b_buf].
+        #      Both go through buffer_load_dwordx4 ... offen lds.
+        #   2. commit_group ties them into one async group.
+        #   3. wait_group(1) drains the older group (current iter's
+        #      A and B reach LDS).
+        #   4. Read A from smem_a[cur_a_buf] into dot_a_layout.
+        #   5. Read B from smem_b[cur_b_buf] into a [BLOCK_N, BLOCK_K]
+        #      tensor, transpose to [BLOCK_K, BLOCK_N], convert into
+        #      dot_b_layout for the MFMA.
+        #   6. Collective MFMA across all 8 warps.
+        # `gl.amd.warp_pipeline_stage` is intentionally NOT used; its
+        # conversion pass implements warp specialization incompatible
+        # with this kernel's collective MFMA.
         for k in range(0, num_k_iter - 1):
             k_off_next = (k + 1) * BLOCK_SIZE_K
             offs_a_n = offs_a_base + k_off_next * stride_ak
@@ -369,17 +397,15 @@ if _GLUON_AVAILABLE:
             cur_a_buf = k % NUM_BUFFERS_A
             nxt_a_buf = (k + 1) % NUM_BUFFERS_A
             cur_b_buf = k % NUM_BUFFERS_B
-
-            smem_b.index(cur_b_buf).store(b)
+            nxt_b_buf = (k + 1) % NUM_BUFFERS_B
 
             if even_Ks:
                 cdna4_async_copy.buffer_load_to_shared(
                     smem_a.index(nxt_a_buf), a_ptr, offs_a_n,
                     mask=token_mask[:, None],
                 )
-                b_next = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr_e,
-                    offsets=offs_b_n,
+                cdna4_async_copy.buffer_load_to_shared(
+                    smem_b.index(nxt_b_buf), b_ptr_e, offs_b_n,
                 )
             else:
                 cdna4_async_copy.buffer_load_to_shared(
@@ -388,10 +414,11 @@ if _GLUON_AVAILABLE:
                     offs_a_n,
                     mask=token_mask[:, None] & (offs_ak[None, :] < K - k_off_next),
                 )
-                b_next = gl.amd.cdna4.buffer_load(
-                    ptr=b_ptr_e,
-                    offsets=offs_b_n,
-                    mask=offs_bk[:, None] < K - k_off_next,
+                cdna4_async_copy.buffer_load_to_shared(
+                    smem_b.index(nxt_b_buf),
+                    b_ptr_e,
+                    offs_b_n,
+                    mask=offs_bk[None, :] < K - k_off_next,
                 )
             cdna4_async_copy.commit_group()
 
@@ -399,19 +426,27 @@ if _GLUON_AVAILABLE:
             cur_a = cdna4_async_copy.load_shared_relaxed(
                 smem_a.index(cur_a_buf), dot_a_layout
             )
-            cur_b = smem_b.index(cur_b_buf).load(layout=dot_b_layout)
+            cur_b_nk = cdna4_async_copy.load_shared_relaxed(
+                smem_b.index(cur_b_buf), load_b_nk_layout
+            )
+            cur_b = gl.convert_layout(
+                cur_b_nk.trans(1, 0), dot_b_layout, assert_trivial=True
+            )
             acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
-            b = b_next
 
         # ---- epilogue: process the last K tile ----
         last_a_buf = (num_k_iter - 1) % NUM_BUFFERS_A
         last_b_buf = (num_k_iter - 1) % NUM_BUFFERS_B
-        smem_b.index(last_b_buf).store(b)
         cdna4_async_copy.wait_group(0)
         cur_a = cdna4_async_copy.load_shared_relaxed(
             smem_a.index(last_a_buf), dot_a_layout
         )
-        cur_b = smem_b.index(last_b_buf).load(layout=dot_b_layout)
+        cur_b_nk = cdna4_async_copy.load_shared_relaxed(
+            smem_b.index(last_b_buf), load_b_nk_layout
+        )
+        cur_b = gl.convert_layout(
+            cur_b_nk.trans(1, 0), dot_b_layout, assert_trivial=True
+        )
         acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
 
         # ---- optional routed-weight scaling ----
