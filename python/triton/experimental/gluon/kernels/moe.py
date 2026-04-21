@@ -331,7 +331,10 @@ if _GLUON_AVAILABLE:
         # before the current iter's MFMA reads finish; wait_group(1) drains
         # the older pair (A and B share the same async commit group).
         # LDS budget per CTA: 2 * 128 * 64 * 2 (A) + 2 * 128 * 64 * 2 (B)
-        # = 32 KiB + 32 KiB = 64 KiB.
+        # = 32 KiB + 32 KiB = 64 KiB. gfx950 has 160 KiB LDS per CU, so
+        # this leaves room for 2 CTAs per CU at the current VGPR pressure.
+        # Bumping to NUM_BUFFERS=3 each was tried (96 KiB) and regressed
+        # 5-15% because the per-CU LDS limit cuts occupancy from 2 to 1.
         NUM_BUFFERS_A: gl.constexpr = 2
         NUM_BUFFERS_B: gl.constexpr = 2
         smem_a = gl.allocate_shared_memory(
