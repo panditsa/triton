@@ -9,7 +9,7 @@ Activation:
     call ``invoke_gluon_fused_moe_kernel`` directly.
 
 Supported tile config:
-    BLOCK_SIZE_M = 128, BLOCK_SIZE_N = 128, BLOCK_SIZE_K = 64, num_warps = 4.
+    BLOCK_SIZE_M = 128, BLOCK_SIZE_N = 128, BLOCK_SIZE_K = 64, num_warps = 8.
     bf16 inputs/outputs, fp32 accumulator.
 
 Supported features:
@@ -24,8 +24,22 @@ Hardware features used:
     - ``v_mfma_f32_16x16x32_bf16`` (matching CK ``kernel_moe_gemm_2lds``)
     - ``buffer_load_dword ... offen lds`` for the A gather
       (``cdna4_async_copy.buffer_load_to_shared``)
-    - manual 2-stage software pipeline with double-buffered LDS for A
+    - 8 warps split as ``warps_per_cta=[2, 4]``; with twice as many warps
+      the wave scheduler has more candidates to hide memory latency,
+      which is the structural prerequisite for ping-pong
+    - double-buffered LDS for both A and B; the manual 2-stage software
+      pipeline overlaps the next iter's HBM loads with the current iter's
+      MFMA reads
     - swizzled LDS layout matching ``DotOperandLayout`` ``k_width=8``
+
+Notes on warp_pipeline_stage:
+    Explicit ping-pong via ``gl.amd.warp_pipeline_stage`` was attempted
+    but does not fit this kernel. The conversion pass turns those
+    markers into a ``CondBarrier`` plus ``s_setprio`` schedule that
+    splits warps into two groups running different loop iterations,
+    which is incompatible with the collective MFMA that all 8 warps
+    participate in. Adding ``s_setprio`` without the warp split would
+    need backend changes outside Gluon.
 
 Notes on the gap to CK ``kernel_moe_gemm_2lds``:
     The Triton AMD backend currently does not allocate AGPRs for MFMA
@@ -78,7 +92,9 @@ _DEFAULT_GLUON_CONFIG: Dict[str, Any] = {
     "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 64,
     "GROUP_SIZE_M": 8,
-    "num_warps": 4,
+    # 8 warps split as warps_per_cta=[2, 4] enable the ping-pong schedule:
+    # two warp groups alternate between issuing memory ops and running MFMA.
+    "num_warps": 8,
     "num_stages": 1,
     # waves_per_eu hint: requesting 2 waves per EU constrains VGPR usage
     # (~128 VGPRs max) which encourages LLVM to spill to AGPRs for the MFMA
@@ -101,7 +117,7 @@ def gluon_config_supported(config: Dict[str, Any], K: int) -> bool:
         return False
     if config.get("BLOCK_SIZE_K") != 64:
         return False
-    if config.get("num_warps", 4) != 4:
+    if config.get("num_warps", 8) != 8:
         return False
     if K % config["BLOCK_SIZE_K"] != 0:
         return False
@@ -159,7 +175,7 @@ if _GLUON_AVAILABLE:
         gl.static_assert(BLOCK_SIZE_M == 128, "Gluon kernel requires BLOCK_SIZE_M=128")
         gl.static_assert(BLOCK_SIZE_N == 128, "Gluon kernel requires BLOCK_SIZE_N=128")
         gl.static_assert(BLOCK_SIZE_K == 64, "Gluon kernel requires BLOCK_SIZE_K=64")
-        gl.static_assert(NUM_WARPS == 4, "Gluon kernel requires num_warps=4")
+        gl.static_assert(NUM_WARPS == 8, "Gluon kernel requires num_warps=8 for ping-pong")
 
         # ---- pid -> (pid_m, pid_n) using grouped order for L2 reuse ----
         pid = gl.program_id(axis=0)
@@ -178,14 +194,16 @@ if _GLUON_AVAILABLE:
             return
 
         # ---- layouts ----
-        # MFMA v_mfma_f32_16x16x32_bf16, 4 warps as 2x2.
+        # MFMA v_mfma_f32_16x16x32_bf16, 8 warps as 2x4 to enable ping-pong.
+        # Per-wave tile: M=128/2=64, N=128/4=32. Per-wave MFMA insns per
+        # K-step: (64/16) * (32/16) * (64/32) = 4 * 2 * 2 = 16.
         MFMA_INSTR_SHAPE: gl.constexpr = [16, 16, 32]
         MFMA_K_WIDTH: gl.constexpr = 8
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=MFMA_INSTR_SHAPE,
             transposed=True,
-            warps_per_cta=[2, 2],
+            warps_per_cta=[2, 4],
         )
         dot_a_layout: gl.constexpr = gl.DotOperandLayout(
             operand_index=0, parent=mfma_layout, k_width=MFMA_K_WIDTH
@@ -281,17 +299,22 @@ if _GLUON_AVAILABLE:
 
         # ---- shared memory ----
         # A uses async LDS-direct loads (the gather pattern matches CK).
-        # Double-buffered so the next iter's load can be issued before the
-        # current iter's MFMA reads finish; wait_group(1) drains the older one.
-        # B uses sync VGPR-staged loads through a single LDS buffer.
+        # B uses sync VGPR-staged loads. Both A and B are double-buffered in
+        # LDS so the next iter's smem write can issue while the MFMA still
+        # reads from the previous buffer; wait_group(1) drains the older A.
+        # LDS budget per CTA: 2 * 128 * 64 * 2 (A) + 2 * 64 * 128 * 2 (B)
+        # = 32 KiB + 32 KiB = 64 KiB.
         NUM_BUFFERS_A: gl.constexpr = 2
+        NUM_BUFFERS_B: gl.constexpr = 2
         smem_a = gl.allocate_shared_memory(
             a_ptr.type.element_ty,
             [NUM_BUFFERS_A, BLOCK_SIZE_M, BLOCK_SIZE_K],
             shared_a,
         )
         smem_b = gl.allocate_shared_memory(
-            b_ptr.type.element_ty, [BLOCK_SIZE_K, BLOCK_SIZE_N], shared_b
+            b_ptr.type.element_ty,
+            [NUM_BUFFERS_B, BLOCK_SIZE_K, BLOCK_SIZE_N],
+            shared_b,
         )
 
         # ---- prologue: issue async A load (buf 0), sync B load to VGPR ----
@@ -325,23 +348,33 @@ if _GLUON_AVAILABLE:
 
         # ---- pipelined K-loop ----
         # Pattern per loop iteration:
-        #   1. Store current B to LDS.
-        #   2. Issue async A load for next iter into the alternate LDS buffer.
-        #   3. Issue sync B load for next iter to VGPR.
-        #   4. wait_group(1): drain the older A load (current iter ready).
-        #   5. Read A and B from LDS, MFMA.
+        #   1. Store current B to LDS[cur_b_buf].
+        #   2. Issue async A load for next iter into smem_a[nxt_a_buf]
+        #      and sync B load for next iter to VGPR.
+        #   3. wait_group(1) drains the older A async load.
+        #   4. Read A from smem_a[cur_a_buf] and B from smem_b[cur_b_buf],
+        #      issue the collective MFMA (all 8 warps participate).
+        # The `gl.amd.warp_pipeline_stage` markers are intentionally NOT
+        # used here. The conversion pass that turns those markers into
+        # `s_setprio` runs through a `CondBarrier`-based warp
+        # specialization where each warp group runs different iterations,
+        # which is incompatible with this kernel's collective MFMA across
+        # all 8 warps. The double-buffering on A and B still lets the
+        # backend overlap the next iter's HBM loads with the current
+        # iter's MFMA reads.
         for k in range(0, num_k_iter - 1):
             k_off_next = (k + 1) * BLOCK_SIZE_K
             offs_a_n = offs_a_base + k_off_next * stride_ak
             offs_b_n = offs_b_base + k_off_next * stride_bk
-            cur_buf = k % NUM_BUFFERS_A
-            nxt_buf = (k + 1) % NUM_BUFFERS_A
+            cur_a_buf = k % NUM_BUFFERS_A
+            nxt_a_buf = (k + 1) % NUM_BUFFERS_A
+            cur_b_buf = k % NUM_BUFFERS_B
 
-            smem_b.store(b)
+            smem_b.index(cur_b_buf).store(b)
 
             if even_Ks:
                 cdna4_async_copy.buffer_load_to_shared(
-                    smem_a.index(nxt_buf), a_ptr, offs_a_n,
+                    smem_a.index(nxt_a_buf), a_ptr, offs_a_n,
                     mask=token_mask[:, None],
                 )
                 b_next = gl.amd.cdna4.buffer_load(
@@ -350,7 +383,7 @@ if _GLUON_AVAILABLE:
                 )
             else:
                 cdna4_async_copy.buffer_load_to_shared(
-                    smem_a.index(nxt_buf),
+                    smem_a.index(nxt_a_buf),
                     a_ptr,
                     offs_a_n,
                     mask=token_mask[:, None] & (offs_ak[None, :] < K - k_off_next),
@@ -364,20 +397,21 @@ if _GLUON_AVAILABLE:
 
             cdna4_async_copy.wait_group(1)
             cur_a = cdna4_async_copy.load_shared_relaxed(
-                smem_a.index(cur_buf), dot_a_layout
+                smem_a.index(cur_a_buf), dot_a_layout
             )
-            cur_b = smem_b.load(layout=dot_b_layout)
+            cur_b = smem_b.index(cur_b_buf).load(layout=dot_b_layout)
             acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
             b = b_next
 
         # ---- epilogue: process the last K tile ----
-        last_buf = (num_k_iter - 1) % NUM_BUFFERS_A
-        smem_b.store(b)
+        last_a_buf = (num_k_iter - 1) % NUM_BUFFERS_A
+        last_b_buf = (num_k_iter - 1) % NUM_BUFFERS_B
+        smem_b.index(last_b_buf).store(b)
         cdna4_async_copy.wait_group(0)
         cur_a = cdna4_async_copy.load_shared_relaxed(
-            smem_a.index(last_buf), dot_a_layout
+            smem_a.index(last_a_buf), dot_a_layout
         )
-        cur_b = smem_b.load(layout=dot_b_layout)
+        cur_b = smem_b.index(last_b_buf).load(layout=dot_b_layout)
         acc = gl.amd.cdna4.mfma(cur_a, cur_b, acc)
 
         # ---- optional routed-weight scaling ----

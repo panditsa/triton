@@ -277,7 +277,7 @@ def test_fused_moe_gemm(E, D, I, top_k, bs, mul_routed_weight):
 
     C = torch.zeros(bs * top_k, 2 * I, dtype=torch.bfloat16, device="cuda")
     cfg = {"BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN, "BLOCK_SIZE_K": BK,
-           "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 2}
+           "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 2}
 
     invoke_gluon_fused_moe_kernel(
         A, W, C, tw, ti, sorted_ids, expert_ids, npp,
@@ -309,7 +309,7 @@ def test_moe_pipeline_integration():
     E, D, I, top_k, bs = 8, 512, 512, 2, 64
     BM, BN, BK = 128, 128, 64
     cfg = {"BLOCK_SIZE_M": BM, "BLOCK_SIZE_N": BN, "BLOCK_SIZE_K": BK,
-           "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 2}
+           "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 2}
 
     x = torch.randn(bs, D, device="cuda", dtype=torch.bfloat16) * 0.1
     w1 = torch.randn(E, 2 * I, D, device="cuda", dtype=torch.bfloat16) * 0.05
