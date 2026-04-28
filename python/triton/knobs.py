@@ -519,6 +519,7 @@ class amd_knobs(base_knobs):
     use_async_copy: env_opt_bool = env_opt_bool("TRITON_HIP_USE_ASYNC_COPY")
 
     scalarize_packed_fops: env_bool = env_bool("AMDGCN_SCALARIZE_PACKED_FOPS")
+    coalesce_buffer_load_i8: env_bool = env_bool("AMDGCN_COALESCE_BUFFER_LOAD_I8")
 
     # Path to dump MIR files for debugging/analysis
     dump_mir: env_opt_str = env_opt_str("TRITON_DUMP_MIR")
