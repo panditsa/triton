@@ -19,7 +19,6 @@
 
 #include <cstdlib>
 #include <optional>
-#include <tuple>
 #include <utility>
 
 #define DEBUG_TYPE "tritonamdgpu-cyclic-buffer-index-reduce"
@@ -29,32 +28,27 @@ using namespace llvm::PatternMatch;
 
 namespace {
 
-// Result of matching `(X << S) & (1 << S)` where the mask isolates exactly
-// the bit at the shift position. The matched value equals `(X & 1) << S`,
-// which is a 2-state value depending on the parity of `X`.
-struct ShiftedSingleBitMatch {
-  Value *x;
-  uint64_t shiftAmt;
+// One canonical alternating-phi per (loop, mask). The phi starts at 0 and
+// toggles to `mask` every iteration. The "next" value is a separate xor at
+// the top of the loop header so it can be used inside the same iteration
+// without violating SSA dominance. Both fields are LLVM IR pointers and
+// stay valid for the entire pass even when the per-(loop, mask) cache
+// DenseMap rehashes.
+struct AlternatingPhi {
+  PHINode *phi;
+  Value *next; // xor(phi, mask)
 };
 
-std::optional<ShiftedSingleBitMatch> matchShiftedSingleBit(Value *v) {
-  if (!v->getType()->isIntegerTy(32))
-    return std::nullopt;
-  Value *x = nullptr;
-  ConstantInt *shamtC = nullptr;
-  ConstantInt *maskC = nullptr;
-  // Match `and(shl(X, S), M)` in either operand order of the and.
-  if (!match(v, m_c_And(m_Shl(m_Value(x), m_ConstantInt(shamtC)),
-                        m_ConstantInt(maskC))))
-    return std::nullopt;
-  uint64_t s = shamtC->getZExtValue();
-  uint64_t m = maskC->getZExtValue();
-  if (s >= 32 || m == 0)
-    return std::nullopt;
-  if (m != (uint64_t{1} << s))
-    return std::nullopt;
-  return ShiftedSingleBitMatch{x, s};
-}
+// A binding records "this SSA value cycles through {0, mask} at iter k=0 if
+// inverted is false, else {mask, 0}". `inverted == false` -> use `phi`;
+// `inverted == true` -> use `next`. Stores raw IR pointers (not into the
+// phi cache) so binding entries survive cache rehashing.
+struct Binding {
+  PHINode *phi;
+  Value *next;
+  bool inverted;
+  uint64_t mask;
+};
 
 // Strip a chain of `add X, c` to recover the underlying value plus the
 // accumulated constant offset.
@@ -106,14 +100,75 @@ std::optional<AffineIVInfo> getStep1IV(Value *v, ScalarEvolution &SE,
   return AffineIVInfo{L, startC->getValue()->getZExtValue()};
 }
 
-// One canonical alternating-phi per (loop, shiftAmt). The phi starts at 0
-// and toggles to (1 << shiftAmt) every iteration. The "next" value is also
-// materialized as a separate xor at the top of the loop header so it can be
-// used inside the same iteration without violating SSA dominance.
-struct AlternatingPhi {
-  PHINode *phi;
-  Value *next; // xor(phi, 1 << shiftAmt)
+// Phase 1 pattern: `Y = and(shl(X, S), 1 << S)`. The mask isolates exactly
+// the bit at the shift position, so `Y = (X & 1) << S`, which is a 2-state
+// value depending on the parity of `X`. Returns (X, S) on success.
+struct ShiftedSingleBitMatch {
+  Value *x;
+  uint64_t shiftAmt;
 };
+
+std::optional<ShiftedSingleBitMatch> matchShiftedSingleBit(Value *v) {
+  if (!v->getType()->isIntegerTy(32))
+    return std::nullopt;
+  Value *x = nullptr;
+  ConstantInt *shamtC = nullptr;
+  ConstantInt *maskC = nullptr;
+  if (!match(v, m_c_And(m_Shl(m_Value(x), m_ConstantInt(shamtC)),
+                        m_ConstantInt(maskC))))
+    return std::nullopt;
+  uint64_t s = shamtC->getZExtValue();
+  uint64_t m = maskC->getZExtValue();
+  if (s >= 32 || m == 0)
+    return std::nullopt;
+  if (m != (uint64_t{1} << s))
+    return std::nullopt;
+  return ShiftedSingleBitMatch{x, s};
+}
+
+// Phase 2 pattern: `Y = or disjoint (lshr exact V, K), V` (in either operand
+// order of the or). Both operands of the or refer to the SAME value V, with
+// one wrapped in `lshr exact V, K`. Returns (V, K) on success.
+struct LshrOrChainMatch {
+  Value *v;
+  uint64_t shrAmt;
+};
+
+std::optional<LshrOrChainMatch> matchLshrOrChain(Value *value) {
+  if (!value->getType()->isIntegerTy(32))
+    return std::nullopt;
+  auto *binOp = dyn_cast<BinaryOperator>(value);
+  if (!binOp || binOp->getOpcode() != Instruction::Or)
+    return std::nullopt;
+  // `or disjoint` is required: it is what allows V | (V >> K) to behave as
+  // arithmetic addition when the bit ranges are disjoint, which is the
+  // semantic guarantee we are folding on. The flag lives on the
+  // PossiblyDisjointInst subclass of BinaryOperator.
+  auto *disjointInst = dyn_cast<PossiblyDisjointInst>(binOp);
+  if (!disjointInst || !disjointInst->isDisjoint())
+    return std::nullopt;
+  Value *opA = binOp->getOperand(0);
+  Value *opB = binOp->getOperand(1);
+  // Try both operand orderings: (lshr V, K) | V  and  V | (lshr V, K).
+  for (int swap = 0; swap < 2; ++swap) {
+    Value *lshrSide = swap ? opB : opA;
+    Value *plainSide = swap ? opA : opB;
+    Value *v = nullptr;
+    ConstantInt *kC = nullptr;
+    if (!match(lshrSide, m_LShr(m_Value(v), m_ConstantInt(kC))))
+      continue;
+    auto *lshrInst = dyn_cast<Instruction>(lshrSide);
+    if (!lshrInst || !lshrInst->isExact())
+      continue;
+    if (v != plainSide)
+      continue;
+    uint64_t k = kC->getZExtValue();
+    if (k == 0 || k >= 32)
+      continue;
+    return LshrOrChainMatch{v, k};
+  }
+  return std::nullopt;
+}
 
 struct CyclicBufferIndexReducePass : FunctionPass {
   CyclicBufferIndexReducePass() : FunctionPass(ID) {}
@@ -129,26 +184,56 @@ struct CyclicBufferIndexReducePass : FunctionPass {
     LoopInfo LI(DT);
     ScalarEvolution SE(F, TLI, AC, DT, LI);
 
-    using Key = std::pair<Loop *, uint64_t>;
-    DenseMap<Key, AlternatingPhi> phiCache;
+    // Per-(loop, mask) cache of alt-phi pairs. Lives across phase 1 and the
+    // iterative phase 2 so that derived phis can also be shared.
+    DenseMap<std::pair<Loop *, uint64_t>, AlternatingPhi> phiCache;
 
-    // Each rewrite says: replace `inst` with either phi (if useNext is false)
-    // or next (if useNext is true), for the (loop, shiftAmt) key.
-    struct Rewrite {
-      Instruction *inst;
-      Key key;
-      bool useNext;
+    // SSA value -> binding into the alt-phi system. Used both to record what
+    // we will rewrite at the end and as the lookup table for phase 2.
+    DenseMap<Value *, Binding> bindings;
+
+    auto getOrCreate = [&](Loop *L, uint64_t mask) -> AlternatingPhi {
+      auto key = std::make_pair(L, mask);
+      auto it = phiCache.find(key);
+      if (it != phiCache.end())
+        return it->second;
+
+      BasicBlock *header = L->getHeader();
+      BasicBlock *preheader = L->getLoopPreheader();
+      BasicBlock *latch = L->getLoopLatch();
+      if (!preheader || !latch)
+        return AlternatingPhi{nullptr, nullptr};
+
+      LLVMContext &ctx = header->getContext();
+      IntegerType *i32Ty = Type::getInt32Ty(ctx);
+      Constant *zero = ConstantInt::get(i32Ty, 0);
+      Constant *maskC = ConstantInt::get(i32Ty, mask);
+
+      // Insert the new phi at the very top of the header so it joins any
+      // existing phi block. The xor goes immediately after all phis so its
+      // value dominates every body use.
+      PHINode *phi =
+          PHINode::Create(i32Ty, /*NumReservedValues=*/2, "cyclic.alt",
+                          header->begin());
+      IRBuilder<> b(header, header->getFirstNonPHIIt());
+      Value *next = b.CreateXor(phi, maskC, "cyclic.alt.next");
+      phi->addIncoming(zero, preheader);
+      phi->addIncoming(next, latch);
+
+      AlternatingPhi result{phi, next};
+      phiCache[key] = result;
+      return result;
     };
-    SmallVector<Rewrite> rewrites;
 
+    // Phase 1: scan for `(X << S) & (1 << S)` where X is a step-1 IV+const.
+    unsigned phase1Hits = 0;
     for (BasicBlock &BB : F) {
       Loop *L = LI.getLoopFor(&BB);
-      if (!L)
-        continue;
-      // Need both preheader and latch to materialize the phi.
-      if (!L->getLoopPreheader() || !L->getLoopLatch())
+      if (!L || !L->getLoopPreheader() || !L->getLoopLatch())
         continue;
       for (Instruction &inst : BB) {
+        if (bindings.count(&inst))
+          continue;
         auto matched = matchShiftedSingleBit(&inst);
         if (!matched)
           continue;
@@ -158,70 +243,100 @@ struct CyclicBufferIndexReducePass : FunctionPass {
         if (!ivInfo || ivInfo->loop != L)
           continue;
 
+        uint64_t mask = uint64_t{1} << matched->shiftAmt;
+        AlternatingPhi alt = getOrCreate(L, mask);
+        if (!alt.phi)
+          continue;
+
         // Canonical phi has init=0 and cycles {0, mask, 0, mask, ...}.
-        // We pick `phi` or `next` based on this match's parity at iter 0.
-        uint64_t parityAtIter0 =
-            ((uint64_t)((int64_t)ivInfo->initVal + addOffset)) & 1ULL;
-        rewrites.push_back({&inst, {L, matched->shiftAmt}, parityAtIter0 != 0});
+        // The match's value at iter 0 has parity (initVal + addOffset) & 1.
+        bool inverted = (((uint64_t)((int64_t)ivInfo->initVal + addOffset)) &
+                         1ULL) != 0;
+        bindings[&inst] = Binding{alt.phi, alt.next, inverted, mask};
+        ++phase1Hits;
       }
     }
 
-    if (rewrites.empty())
+    // Phase 2: iteratively scan for `or disjoint (lshr exact V, K), V` where
+    // V is itself a known cyclic-2 value. The result cycles through
+    // `{0, M | (M >> K)}` if V is canonical (or the inverted mirror if V is
+    // inverted). Iterate until no more matches to handle deeper chains.
+    unsigned phase2Hits = 0;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (BasicBlock &BB : F) {
+        Loop *L = LI.getLoopFor(&BB);
+        if (!L || !L->getLoopPreheader() || !L->getLoopLatch())
+          continue;
+        for (Instruction &inst : BB) {
+          if (bindings.count(&inst))
+            continue;
+          auto matched = matchLshrOrChain(&inst);
+          if (!matched)
+            continue;
+          auto vIt = bindings.find(matched->v);
+          if (vIt == bindings.end())
+            continue;
+          // Copy out everything we need from V's binding BEFORE any
+          // operation that can rehash `bindings` and invalidate `vIt`.
+          Binding vBinding = vIt->second;
+          // V's binding must be in the same loop as the chain.
+          if (vBinding.phi->getParent() != L->getHeader())
+            continue;
+          uint64_t oldMask = vBinding.mask;
+          uint64_t k = matched->shrAmt;
+          if (k >= 32)
+            continue;
+          uint64_t shifted = oldMask >> k;
+          // The fold is only valid when the two bit-ranges are disjoint;
+          // the `or disjoint` flag asserts this for the IR, but we double
+          // check on the masks to keep the new mask sound.
+          if ((shifted & oldMask) != 0)
+            continue;
+          uint64_t newMask = oldMask | shifted;
+          if (newMask == 0)
+            continue;
+          AlternatingPhi altNew = getOrCreate(L, newMask);
+          if (!altNew.phi)
+            continue;
+          bindings[&inst] =
+              Binding{altNew.phi, altNew.next, vBinding.inverted, newMask};
+          ++phase2Hits;
+          changed = true;
+        }
+      }
+    }
+
+    if (bindings.empty())
       return false;
 
-    auto getOrCreate = [&](Loop *L, uint64_t shiftAmt) -> AlternatingPhi {
-      Key key{L, shiftAmt};
-      auto it = phiCache.find(key);
-      if (it != phiCache.end())
-        return it->second;
-
-      BasicBlock *header = L->getHeader();
-      BasicBlock *preheader = L->getLoopPreheader();
-      BasicBlock *latch = L->getLoopLatch();
-      LLVMContext &ctx = header->getContext();
-      IntegerType *i32Ty = Type::getInt32Ty(ctx);
-      uint64_t mask = uint64_t{1} << shiftAmt;
-      Constant *zero = ConstantInt::get(i32Ty, 0);
-      Constant *maskC = ConstantInt::get(i32Ty, mask);
-
-      // PHI nodes must come at the top of the header. Insert at begin();
-      // any existing phis stay grouped because the new phi joins them.
-      PHINode *phi =
-          PHINode::Create(i32Ty, /*NumReservedValues=*/2, "cyclic.alt",
-                          header->begin());
-
-      // The xor goes right after all phis so its value is available to all
-      // body instructions without violating SSA dominance.
-      IRBuilder<> b(header, header->getFirstNonPHIIt());
-      Value *next = b.CreateXor(phi, maskC, "cyclic.alt.next");
-
-      phi->addIncoming(zero, preheader);
-      phi->addIncoming(next, latch);
-
-      AlternatingPhi result{phi, next};
-      phiCache[key] = result;
-      return result;
-    };
-
-    unsigned numRewrites = 0;
-    for (const Rewrite &r : rewrites) {
-      AlternatingPhi alt = getOrCreate(r.key.first, r.key.second);
-      Value *replacement = r.useNext ? alt.next : alt.phi;
-      r.inst->replaceAllUsesWith(replacement);
-      ++numRewrites;
+    // Apply rewrites: replace each bound instruction with the appropriate
+    // alt-phi value (canonical phi or its in-iter xor).
+    SmallVector<Instruction *> toErase;
+    for (auto &kv : bindings) {
+      Instruction *inst = cast<Instruction>(kv.first);
+      Value *replacement =
+          kv.second.inverted ? kv.second.next : kv.second.phi;
+      // Don't try to RAUW a value with itself (defensive; should not happen).
+      if (replacement == inst)
+        continue;
+      inst->replaceAllUsesWith(replacement);
+      toErase.push_back(inst);
     }
-    for (const Rewrite &r : rewrites) {
-      if (r.inst->use_empty())
-        r.inst->eraseFromParent();
+    for (Instruction *inst : toErase) {
+      if (inst->use_empty())
+        inst->eraseFromParent();
     }
 
-    bool changed = numRewrites > 0;
-    if (changed || std::getenv("AMDGCN_CYCLIC_BUFFER_INDEX_REDUCE_VERBOSE")) {
+    if (std::getenv("AMDGCN_CYCLIC_BUFFER_INDEX_REDUCE_VERBOSE") ||
+        !bindings.empty()) {
       errs() << "[CyclicBufferIndexReduce] " << F.getName() << ": "
-             << numRewrites << " (X<<S)&(1<<S) -> alt-phi rewrite(s); "
-             << phiCache.size() << " phi(s) inserted\n";
+             << phase1Hits << " single-bit + " << phase2Hits
+             << " lshr-or chain rewrite(s); " << phiCache.size()
+             << " phi(s) inserted\n";
     }
-    return changed;
+    return true;
   }
 
   static char ID;
