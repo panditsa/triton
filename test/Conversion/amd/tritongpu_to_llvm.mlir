@@ -486,20 +486,14 @@ module attributes {"ttg.target" = "hip:gfx942", "ttg.num-ctas" = 1 : i32, "ttg.n
   tt.func @padded_shared_layout_subview(%arg0: !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable>) {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
-    // Skip three constants from the stride calculation
-    // GFX950: llvm.mlir.constant
-    // GFX950: llvm.mlir.constant
-    // GFX950: llvm.mlir.constant
 
-    // GFX950-DAG: %[[CST0:.+]] = llvm.mlir.constant(0 : i32)
-    // GFX950-DAG: %[[CST7:.+]] = llvm.mlir.constant(7 : i32)
-    // GFX950-DAG: %[[CST2:.+]] = llvm.mlir.constant(2 : i32)
-
-    // GFX950-DAG: %[[SHR0:.+]] = llvm.lshr %[[ADD:.+]], %[[CST7]] : i32
-    // GFX950-NEXT: %[[SHL0:.+]] = llvm.shl %[[SHR0]], %[[CST2]] : i32
-    // GFX950-NEXT: %[[ADD1:.+]] = llvm.add %[[CST0]], %[[SHL0]] : i32
-    // GFX950-NEXT: %[[ADD2:.+]] = llvm.add %[[ADD]], %[[ADD1]] : i32
-    // GFX950: llvm.getelementptr %{{.+}}[%[[ADD2]]]
+    // The constant index `%c1_i32` is recognized as a 1-element alphabet, so
+    // MemDescIndexOpConversion folds the `mul + applyPadding` chain into a
+    // single precomputed offset constant: 1 * stride(4096) + pad(128) = 4224.
+    // GFX950-NOT: llvm.mul
+    // GFX950-NOT: llvm.lshr
+    // GFX950: %[[OFF:.+]] = llvm.mlir.constant(4224 : i32) : i32
+    // GFX950: llvm.getelementptr %{{.+}}[%[[OFF]]]
 
     %1 = ttg.memdesc_index %arg0[%c1_i32] : !ttg.memdesc<2x64x64xf16, #shared, #smem, mutable> -> !ttg.memdesc<64x64xf16, #shared, #smem, mutable>
     tt.return

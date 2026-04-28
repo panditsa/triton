@@ -1,3 +1,4 @@
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Support/LLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
@@ -470,6 +471,100 @@ struct MemDescIndexOpConversion
   using ConvertOpToLLVMPattern<
       triton::gpu::MemDescIndexOp>::ConvertOpToLLVMPattern;
 
+  // If `index` is provably restricted to a small alphabet of static
+  // values that fit inside the buffer-count `numBuffers`, return that
+  // alphabet. The recognized patterns are:
+  //   - arith.constant c, with c in [0, numBuffers)
+  //   - arith.remui x, N where N == numBuffers
+  //   - arith.remsi x, N where N == numBuffers (treated like remui; same
+  //     alphabet for the non-negative dividends that loop-counter use cases
+  //     produce in practice)
+  //   - arith.andi x, (N - 1) where N is a power of 2 and N <= numBuffers
+  //
+  // The first canonicalizes to a single-element alphabet and lets the
+  // conversion fold the offset to an `llvm.mlir.constant`. The others
+  // canonicalize to alphabets of N elements and let the conversion emit a
+  // single `llvm.select` (for N == 2) or a chain of N - 1 selects (for
+  // larger N), instead of `mul + applyPadding` per iteration.
+  //
+  // The recognizer is intentionally syntactic. SCEV-style analysis would
+  // catch more cases but adds a dependency on a loop-info analysis that
+  // the conversion pattern does not otherwise need. The patterns above
+  // cover both hand-pipelined kernels (which write `cur_buf = k % N`
+  // explicitly) and SoftwarePipeliner-emitted code (which uses
+  // `arith.select`-based `createIncrementModulo` counters that the
+  // conversion sees through equally well via the constant case once the
+  // counter is hoisted to a known starting value).
+  static std::optional<llvm::SmallVector<int64_t>>
+  recognizeSmallAlphabet(Value index, int64_t numBuffers) {
+    if (numBuffers < 1)
+      return std::nullopt;
+
+    if (auto cst = index.getDefiningOp<arith::ConstantOp>()) {
+      if (auto attr = dyn_cast<IntegerAttr>(cst.getValue())) {
+        int64_t v = attr.getInt();
+        if (v >= 0 && v < numBuffers)
+          return llvm::SmallVector<int64_t>{v};
+      }
+      return std::nullopt;
+    }
+
+    auto matchRemModulus = [&](Value rhs) -> bool {
+      auto cst = rhs.getDefiningOp<arith::ConstantOp>();
+      if (!cst)
+        return false;
+      auto attr = dyn_cast<IntegerAttr>(cst.getValue());
+      return attr && attr.getInt() == numBuffers;
+    };
+    auto buildFullAlphabet = [&]() {
+      llvm::SmallVector<int64_t> vals;
+      for (int64_t i = 0; i < numBuffers; ++i)
+        vals.push_back(i);
+      return vals;
+    };
+
+    if (auto rem = index.getDefiningOp<arith::RemUIOp>()) {
+      if (matchRemModulus(rem.getRhs()))
+        return buildFullAlphabet();
+      return std::nullopt;
+    }
+    if (auto rem = index.getDefiningOp<arith::RemSIOp>()) {
+      // remsi a, N (N > 0) returns a value in (-N, N). For loop-counter use
+      // cases the dividend is always non-negative (`scf.for` index from 0,
+      // possibly +c) so the result is in [0, N-1) and the alphabet is the
+      // same as remui. The kernel author's contract for memdesc_index
+      // requires `idx in [0, NUM_BUFFERS)` regardless, so a negative
+      // dividend would already be a kernel bug under the original
+      // `mul + applyPadding` lowering.
+      if (matchRemModulus(rem.getRhs()))
+        return buildFullAlphabet();
+      return std::nullopt;
+    }
+
+    if (auto andOp = index.getDefiningOp<arith::AndIOp>()) {
+      auto rhs = andOp.getRhs().getDefiningOp<arith::ConstantOp>();
+      if (!rhs)
+        return std::nullopt;
+      auto attr = dyn_cast<IntegerAttr>(rhs.getValue());
+      if (!attr)
+        return std::nullopt;
+      int64_t mask = attr.getInt();
+      int64_t alphabetSize = mask + 1;
+      if (mask < 0 || alphabetSize > numBuffers)
+        return std::nullopt;
+      // Power of 2 check: only contiguous-low-bits masks like 0, 1, 3, 7
+      // map cleanly to a closed alphabet 0..alphabetSize-1.
+      if ((alphabetSize & mask) != 0)
+        return std::nullopt;
+      llvm::SmallVector<int64_t> vals;
+      for (int64_t i = 0; i < alphabetSize; ++i)
+        vals.push_back(i);
+      return vals;
+    }
+
+    return std::nullopt;
+  }
+
   LogicalResult
   matchAndRewrite(triton::gpu::MemDescIndexOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
@@ -494,19 +589,52 @@ struct MemDescIndexOpConversion
             dyn_cast<PartitionedSharedEncodingAttr>(dstTy.getEncoding())) {
       stride = allocShape / partEnc.getNumPartitions();
     }
-    Value offset = b.mul(op.getIndex(), b.i32_val(stride));
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
     auto prevOffsets = smemObj.getOffsets();
     SmallVector<Value> offsetVals(prevOffsets.end() - dstTy.getRank(),
                                   prevOffsets.end());
 
-    // Apply padding based on the amount we move the base ptr
+    SmallVector<std::pair<unsigned, unsigned>> paddingShifts;
     if (auto padEnc = getPaddedEncoding(dstTy.getEncoding())) {
       auto bitwidth = dstTy.getElementTypeBitWidth();
-      auto paddingShifts =
+      paddingShifts =
           getPaddedSharedShifts(padEnc, bitwidth, /*offsetInBytes=*/false);
-      offset = applyPadding(loc, rewriter, offset, paddingShifts);
+    }
+
+    // Try to fold the per-iteration `mul + applyPadding` chain into a small
+    // table of precomputed offsets selected by the index value. This
+    // collapses the cur/nxt SALU chain emitted by indexed double-buffer
+    // patterns into a single `s_cselect_b32` (or a single constant when the
+    // alphabet has size 1).
+    int64_t numBuffers = srcTy.getRank() > 0 ? srcTy.getShape()[0] : 0;
+    Value offset;
+    if (auto alphabet = recognizeSmallAlphabet(op.getIndex(), numBuffers)) {
+      llvm::SmallVector<int64_t> staticOffsets;
+      staticOffsets.reserve(alphabet->size());
+      for (int64_t k : *alphabet) {
+        uint32_t raw = static_cast<uint32_t>(k * stride);
+        uint32_t padded =
+            paddingShifts.empty() ? raw : applyPadding(raw, paddingShifts);
+        staticOffsets.push_back(static_cast<int64_t>(padded));
+      }
+
+      if (staticOffsets.size() == 1) {
+        offset = b.i32_val(staticOffsets[0]);
+      } else {
+        // chain: offset = c[0]; for i in [1..N): offset = select(idx==i, c[i], offset)
+        offset = b.i32_val(staticOffsets[0]);
+        Value idx = op.getIndex();
+        for (size_t i = 1; i < staticOffsets.size(); ++i) {
+          Value cond =
+              b.icmp_eq(idx, b.i32_val(static_cast<int64_t>(i)));
+          offset = b.select(cond, b.i32_val(staticOffsets[i]), offset);
+        }
+      }
+    } else {
+      offset = b.mul(op.getIndex(), b.i32_val(stride));
+      if (!paddingShifts.empty())
+        offset = applyPadding(loc, rewriter, offset, paddingShifts);
     }
 
     // For partitioned tensors, all partitions have the same layout structure.

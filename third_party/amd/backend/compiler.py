@@ -491,9 +491,6 @@ class HIPBackend(BaseBackend):
         if knobs.amd.scalarize_packed_fops:
             amd.add_scalarize_packed_fops_llvm_pass(kernel_fn)
 
-        if knobs.amd.cyclic_buffer_index_reduce:
-            amd.add_cyclic_buffer_index_reduce_llvm_pass(kernel_fn)
-
         # Get some metadata
         metadata["num_warps"] = total_warps_num
         metadata["shared"] = src.get_int_attr("ttg.shared")

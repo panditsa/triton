@@ -550,13 +550,16 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
   // CHECK: llvm.mlir.global external @global_smem
   // CHECK-LABEL: rank_reducing_subview
   tt.func @rank_reducing_subview() {
+    // The constant index `%index = 1` is recognized as a 1-element alphabet,
+    // so MemDescIndexOpConversion folds the per-iteration `mul` into a single
+    // precomputed offset constant: 1 * stride(512) = 512.
     // CHECK: llvm.mlir.addressof @global_smem
-    // CHECK: llvm.mlir.constant(512 : i32) : i32
-    // CHECK-NEXT: llvm.mul
+    // CHECK-NOT: llvm.mul
+    // CHECK: llvm.extractvalue
     // CHECK-NEXT: llvm.extractvalue
     // CHECK-NEXT: llvm.extractvalue
     // CHECK-NEXT: llvm.extractvalue
-    // CHECK-NEXT: llvm.extractvalue
+    // CHECK-NEXT: llvm.mlir.constant(512 : i32) : i32
     // CHECK-NEXT: llvm.getelementptr
     %index = arith.constant 1 : i32
     %zero = arith.constant 0 : i32
