@@ -11,11 +11,30 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
                                 %arg2: tensor<32x64xi32, #blocked>,
                                 %arg3: !ttg.memdesc<32x64xf32, #shared, #smem, mutable>) {
     // Each thread needs to load 8 elements and we load 1 (sizePerThread) per buffer load instruction
-    // COMMON: rocdl.make.buffer.rsrc
+    // COMMON: %[[fallback:.*]] = llvm.mlir.constant(2147483646 : i64) : i64
+    // COMMON: rocdl.make.buffer.rsrc {{.*}}, {{.*}}, %[[fallback]], {{.*}}
     // COMMON-NOT: rocdl.make.buffer.rsrc
     // COMMON-COUNT-8: rocdl.raw.ptr.buffer.load.async.lds
     // COMMON-NOT: rocdl.raw.ptr.buffer.load.async.lds
     %65 = amdg.buffer_load_to_local %arg1[%arg2] into %arg3 : <f32>[tensor<32x64xi32, #blocked>] -> <32x64xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [4, 1], order = [1, 0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shared = 8192 : i32, ttg.target = "hip:gfx942", "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: buffer_load_to_local_valid_bytes
+  tt.func public @buffer_load_to_local_valid_bytes(%arg1: !tt.ptr<f32>, %arg2: tensor<32x64xi32, #blocked>,
+                                %arg3: !ttg.memdesc<32x64xf32, #shared, #smem, mutable>) {
+    %valid = arith.constant 4096 : i64
+    // COMMON: %[[valid:.*]] = llvm.mlir.constant(4096 : i64) : i64
+    // COMMON: rocdl.make.buffer.rsrc {{.*}}, {{.*}}, %[[valid]], {{.*}}
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    %65 = amdg.buffer_load_to_local %arg1[%arg2] validBytes = %valid into %arg3 : <f32>[tensor<32x64xi32, #blocked>] -> <32x64xf32, #shared, #smem, mutable>
     tt.return
   }
 }
