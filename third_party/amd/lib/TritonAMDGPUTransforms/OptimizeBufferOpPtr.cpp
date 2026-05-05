@@ -324,12 +324,27 @@ struct AdvanceBasePointer : public OpRewritePattern<scf::ForOp> {
     return val.getParentBlock()->getParentOp()->isProperAncestor(loop);
   }
 
+  static Value getValidBytes(amdttg::BufferOpInterface op) {
+    Operation *operation = op.getOperation();
+    if (auto load = dyn_cast<amdttg::BufferLoadOp>(operation))
+      return load.getValidBytes();
+    if (auto loadToLocal = dyn_cast<amdttg::BufferLoadToLocalOp>(operation))
+      return loadToLocal.getValidBytes();
+    return {};
+  }
+
   // Perform series of checks to decide if given operation could be optimized.
   // If optimization is possible, return filled BufferOpInfo.
   static std::optional<BufferOpInfo>
   analyzeBufferOp(amdttg::BufferOpInterface op, scf::ForOp targetFor,
                   DataFlowSolver *solver) {
     auto offsetValue = op.getOffsets();
+
+    if (getValidBytes(op)) {
+      LDBG("Rejected: descriptor-backed buffer ops need matching validBytes "
+           "updates before base pointer optimization");
+      return {};
+    }
 
     // Try to match components of two following patterns:
     //

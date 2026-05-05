@@ -47,8 +47,8 @@ namespace mlir::LLVM::AMD {
 BufferEmitter::BufferEmitter(RewriterBase &rw, Location loc, TargetInfo ti)
     : rewriter(rw), loc(loc), targetInfo(ti) {}
 
-Value BufferEmitter::createResourceDescriptor(Value basePtr,
-                                              Value blockStride) {
+Value BufferEmitter::createResourceDescriptor(Value basePtr, Value blockStride,
+                                              Value validBytes) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   // 1. Create the resource descriptor
   // bits 0-11: dst sel, ignored by these intrinsics
@@ -114,7 +114,9 @@ Value BufferEmitter::createResourceDescriptor(Value basePtr,
 
   Value flagsConst = b.int_val(32, flags);
   Type rsrcType = LLVM::LLVMPointerType::get(rewriter.getContext(), 8);
-  Value numRecordsByte = b.int_val(64, std::numeric_limits<int>::max() - 1);
+  Value numRecordsByte =
+      validBytes ? validBytes
+                 : b.int_val(64, std::numeric_limits<int>::max() - 1);
 
   Value resource = rewriter.createOrFold<ROCDL::MakeBufferRsrcOp>(
       loc, rsrcType, basePtr, stride, numRecordsByte, flagsConst);
@@ -320,13 +322,13 @@ void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
   }
   if (!useSplit)
     vOffsetBytes = b.mul(b.int_val(32, elementByteWidth), vOffsetElems);
-  Value maskedOffsetBytes = b.select(pred, vOffsetBytes, vOffsetOutOfBunds);
 
-  // Default soffset is zero; keep this emission after the maskedOffsetBytes
-  // select so the un-split IR shape is byte-identical to the pre-change
-  // form (matters for the lit test that pins the op order).
+  // Default soffset is zero for unsplit offsets. Masked lanes compensate for
+  // nonzero soffset below so voffset + soffset still reaches the OOB sentinel.
   if (!useSplit)
     sgprOffset = b.int_val(32, 0);
+  Value falseOffsetBytes = b.sub(vOffsetOutOfBunds, sgprOffset);
+  Value maskedOffsetBytes = b.select(pred, vOffsetBytes, falseOffsetBytes);
 
   // 3. Create the cache modifiers word
   int32_t aux =

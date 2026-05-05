@@ -1,15 +1,32 @@
 // RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=arch=gfx942 | FileCheck %s
 // RUN: triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=arch=gfx950 | FileCheck %s
+// RUN: env AMDGCN_BUFFER_LOAD_SOFFSET=1 triton-opt %s -split-input-file --convert-triton-amdgpu-to-llvm=arch=gfx950 | FileCheck %s --check-prefix=SOFFSET
 
 #blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     // CHECK-LABEL: buffer_load
     tt.func @buffer_load(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %offset : tensor<128xi32, #blocked0>{tt.divisibility=16:i32}) {
+        // CHECK: %[[fallback:.*]] = llvm.mlir.constant(2147483646 : i64) : i64
+        // CHECK: rocdl.make.buffer.rsrc {{.*}}, {{.*}}, %[[fallback]], {{.*}}
         // CHECK: %[[c_mask:.*]] = llvm.mlir.constant(true) : i1
         // CHECK: %[[offset:.*]] = llvm.select %[[c_mask]]
         // CHECK: %[[aux:.*]] = llvm.mlir.constant(3 : i32) : i32
         // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[offset]], {{.*}}, %[[aux]]
         %ret = amdg.buffer_load %arg0[%offset] cacheModifier = cs : tensor<128xf32, #blocked0>
+        tt.return
+  }
+}
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+    // CHECK-LABEL: buffer_load_valid_bytes
+    tt.func @buffer_load_valid_bytes(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %offset : tensor<128xi32, #blocked0>{tt.divisibility=16:i32}) {
+        %valid = arith.constant 4096 : i64
+        // CHECK: %[[valid:.*]] = llvm.mlir.constant(4096 : i64) : i64
+        // CHECK: rocdl.make.buffer.rsrc {{.*}}, {{.*}}, %[[valid]], {{.*}}
+        %ret = amdg.buffer_load %arg0[%offset] validBytes = %valid : tensor<128xf32, #blocked0>
         tt.return
   }
 }
@@ -32,6 +49,26 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
         // CHECK: %[[offset:.*]] = llvm.select %[[mask]]
         // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[offset]]
         %ret = amdg.buffer_load %arg0[%offset], %7 stride = %c256_i32 : tensor<128xf32, #blocked0>
+        tt.return
+  }
+}
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+    // SOFFSET-LABEL: buffer_load_mask_soffset_oob
+    tt.func @buffer_load_mask_soffset_oob(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %base_offset : i32, %N : i32) {
+        %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked0>
+        %base = tt.splat %base_offset : i32 -> tensor<128xi32, #blocked0>
+        %offset = arith.addi %base, %range : tensor<128xi32, #blocked0>
+        %n = tt.splat %N: i32 -> tensor<128xi32, #blocked0>
+        %mask = arith.cmpi slt, %range, %n: tensor<128xi32, #blocked0>
+        // SOFFSET: %[[soffset:.*]] = llvm.mul
+        // SOFFSET: %[[false_offset:.*]] = llvm.sub {{.*}}, %[[soffset]] : i32
+        // SOFFSET: %[[masked_offset:.*]] = llvm.select {{.*}}, {{.*}}, %[[false_offset]] : i1, i32
+        // SOFFSET: rocdl.raw.ptr.buffer.load {{.*}}, %[[masked_offset]], %[[soffset]]
+        %ret = amdg.buffer_load %arg0[%offset], %mask : tensor<128xf32, #blocked0>
         tt.return
   }
 }
