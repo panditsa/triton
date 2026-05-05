@@ -726,6 +726,115 @@ bool rewriteLDSLoadCluster(const LDSLoadCluster &cluster,
   return true;
 }
 
+bool tryFoldLDSVectorPhiScale(BitCastInst *bc, IRBuilder<> &builder) {
+  auto *dstTy = dyn_cast<IntegerType>(bc->getDestTy());
+  if (!dstTy || dstTy->getBitWidth() != 32)
+    return false;
+  if (!isUsedByScaledMFMA(bc))
+    return false;
+
+  auto *phi = dyn_cast<PHINode>(bc->getOperand(0));
+  if (!phi)
+    return false;
+
+  auto *vecTy = dyn_cast<FixedVectorType>(phi->getType());
+  if (!vecTy || !vecTy->getElementType()->isIntegerTy(8) ||
+      vecTy->getNumElements() != 4)
+    return false;
+
+  SmallVector<LoadInst *, 4> incomingLoads;
+  incomingLoads.reserve(phi->getNumIncomingValues());
+  for (Value *incoming : phi->incoming_values()) {
+    auto *load = dyn_cast<LoadInst>(incoming);
+    if (!load || !load->isSimple())
+      return false;
+    if (load->getType() != phi->getType())
+      return false;
+    if (!isAddrSpace3Pointer(load->getPointerOperand()))
+      return false;
+    if (load->getAlign() < Align(4))
+      return false;
+    incomingLoads.push_back(load);
+  }
+
+  Type *i32Ty = Type::getInt32Ty(bc->getContext());
+  builder.SetInsertPoint(phi->getParent(), phi->getParent()->getFirstNonPHIIt());
+  PHINode *widePhi =
+      builder.CreatePHI(i32Ty, phi->getNumIncomingValues(), "coalesced.lds.vec.phi");
+  widePhi->setDebugLoc(phi->getDebugLoc());
+
+  for (unsigned i = 0; i < phi->getNumIncomingValues(); ++i) {
+    LoadInst *load = incomingLoads[i];
+    IRBuilder<> loadBuilder(load->getNextNode());
+    LoadInst *wideLoad = loadBuilder.CreateLoad(
+        i32Ty, load->getPointerOperand(), "coalesced.lds.vec.dword");
+    wideLoad->setAlignment(Align(4));
+    wideLoad->setDebugLoc(load->getDebugLoc());
+    widePhi->addIncoming(wideLoad, phi->getIncomingBlock(i));
+  }
+
+  bc->replaceAllUsesWith(widePhi);
+  bc->eraseFromParent();
+  RecursivelyDeleteTriviallyDeadInstructions(phi);
+  return true;
+}
+
+bool tryFoldBytePhiRepack(BitCastInst *bc,
+                          const std::array<Value *, 4> &bytes) {
+  std::array<PHINode *, 4> phis = {nullptr, nullptr, nullptr, nullptr};
+  for (int i = 0; i < 4; ++i) {
+    phis[i] = dyn_cast<PHINode>(bytes[i]);
+    if (!phis[i] || !phis[i]->getType()->isIntegerTy(8))
+      return false;
+    if (phis[i]->getNumIncomingValues() != phis[0]->getNumIncomingValues())
+      return false;
+    if (phis[i]->getParent() != phis[0]->getParent())
+      return false;
+  }
+
+  unsigned numIncoming = phis[0]->getNumIncomingValues();
+  SmallVector<Value *, 4> incomingDwords;
+  incomingDwords.reserve(numIncoming);
+  for (unsigned incomingIdx = 0; incomingIdx < numIncoming; ++incomingIdx) {
+    BasicBlock *incomingBB = phis[0]->getIncomingBlock(incomingIdx);
+    Value *dword = nullptr;
+    for (int byteIdxExpected = 0; byteIdxExpected < 4; ++byteIdxExpected) {
+      if (phis[byteIdxExpected]->getIncomingBlock(incomingIdx) != incomingBB)
+        return false;
+
+      Value *byteDword = nullptr;
+      unsigned byteIdx = 0;
+      if (!decomposeByteExtract(
+              phis[byteIdxExpected]->getIncomingValue(incomingIdx), byteDword,
+              byteIdx))
+        return false;
+      if (byteIdx != (unsigned)byteIdxExpected)
+        return false;
+      if (byteIdxExpected == 0) {
+        dword = byteDword;
+      } else if (dword != byteDword) {
+        return false;
+      }
+    }
+    incomingDwords.push_back(dword);
+  }
+
+  IRBuilder<> builder(phis[0]->getParent(),
+                      phis[0]->getParent()->getFirstNonPHIIt());
+  Type *i32Ty = Type::getInt32Ty(bc->getContext());
+  PHINode *widePhi =
+      builder.CreatePHI(i32Ty, numIncoming, "coalesced.scale.dword.phi");
+  widePhi->setDebugLoc(phis[0]->getDebugLoc());
+  for (unsigned i = 0; i < numIncoming; ++i)
+    widePhi->addIncoming(incomingDwords[i], phis[0]->getIncomingBlock(i));
+
+  bc->replaceAllUsesWith(widePhi);
+  bc->eraseFromParent();
+  for (PHINode *phi : phis)
+    RecursivelyDeleteTriviallyDeadInstructions(phi);
+  return true;
+}
+
 // Detect the pattern that AMD's convertScaledMFMA emits to build the packed
 // i32 scale operand for the MFMA intrinsic:
 //
@@ -755,23 +864,12 @@ bool tryFoldExtractRepack(BitCastInst *bc) {
   if (!dstTy || dstTy->getBitWidth() != 32)
     return false;
   bool dbg = std::getenv("AMDGCN_COALESCE_BUFFER_LOAD_I8_DEBUG_FOLD");
-  // Walk the insertelement chain backwards collecting bytes by index.
   std::array<Value *, 4> bytes = {nullptr, nullptr, nullptr, nullptr};
-  Value *cur = src;
-  while (auto *ie = dyn_cast<InsertElementInst>(cur)) {
-    auto *idxC = dyn_cast<ConstantInt>(ie->getOperand(2));
-    if (!idxC)
-      return false;
-    uint64_t i = idxC->getZExtValue();
-    if (i >= 4)
-      return false;
-    if (bytes[i] == nullptr)
-      bytes[i] = ie->getOperand(1);
-    cur = ie->getOperand(0);
-  }
-  for (int i = 0; i < 4; ++i)
-    if (bytes[i] == nullptr)
-      return false;
+  if (!collectI8VectorBytes(src, bytes))
+    return false;
+
+  if (tryFoldBytePhiRepack(bc, bytes))
+    return true;
 
   // Decompose each byte into (sourceDword, srcByteIndex).
   std::array<Value *, 4> srcDwords = {nullptr, nullptr, nullptr, nullptr};
@@ -893,6 +991,7 @@ struct CoalesceBufferLoadI8Pass : FunctionPass {
 
     unsigned numLDSStoreQuartets = 0;
     unsigned numLDSLoadQuartets = 0;
+    unsigned numLDSVectorPhiFolds = 0;
     if (functionHasScaledMFMA(F)) {
       SmallVector<StoreInst *> storesToErase;
       SmallVector<Instruction *> storeValuesToDCE;
@@ -923,12 +1022,17 @@ struct CoalesceBufferLoadI8Pass : FunctionPass {
             bitcastsToRewrite.push_back(bc);
       for (BitCastInst *bc : bitcastsToRewrite) {
         LDSLoadCluster cluster;
-        if (!tryCollectLDSLoadCluster(bc, SE, DL, cluster))
+        if (tryCollectLDSLoadCluster(bc, SE, DL, cluster)) {
+          if (!rewriteLDSLoadCluster(cluster, builder))
+            continue;
+          ++numLDSLoadQuartets;
+          changed = true;
           continue;
-        if (!rewriteLDSLoadCluster(cluster, builder))
-          continue;
-        ++numLDSLoadQuartets;
-        changed = true;
+        }
+        if (tryFoldLDSVectorPhiScale(bc, builder)) {
+          ++numLDSVectorPhiFolds;
+          changed = true;
+        }
       }
     }
 
@@ -954,7 +1058,8 @@ struct CoalesceBufferLoadI8Pass : FunctionPass {
              << " quartet(s) + " << numPairs
              << " pair(s); LDS coalesced " << numLDSStoreQuartets
              << " store quartet(s) + " << numLDSLoadQuartets
-             << " load quartet(s); folded " << numFolds
+             << " load quartet(s) + " << numLDSVectorPhiFolds
+             << " vector phi scale fold(s); folded " << numFolds
              << " extract+repack scale i32(s)\n";
     }
     return changed;
