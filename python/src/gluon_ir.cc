@@ -1012,10 +1012,10 @@ void init_gluon_ir(py::module &&m) {
       .def("create_buffer_load_to_local",
            [](GluonOpBuilder &self, Value dest, Value ptr, Value offsets,
               Value mask, Value other, Value stride, Value validBytes,
-              tt::CacheModifier cacheModifier, int32_t contiguity) {
+              tt::CacheModifier cacheModifier) {
              self.create<ttag::BufferLoadToLocalOp>(
                  dest, ptr, offsets, mask, other, stride, validBytes,
-                 cacheModifier, contiguity);
+                 cacheModifier);
            })
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Type resultTy, Value &base,
