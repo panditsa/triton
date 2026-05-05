@@ -315,6 +315,7 @@ def BufferLoadOp : TT_AMDGPU_Op<"buffer_load", [
       Arg<TT_Ptr, "Global memory scalar base pointer to load from", [MemRead<GlobalMemory>]>:$ptr,
       I32Tensor:$offsets,
       Optional<I32>:$stride,
+      Optional<I64>:$validBytes,
       DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::NONE">:$cache,
       Optional<TT_BoolTensor>:$mask,
       Optional<TT_Tensor>:$other,
@@ -326,6 +327,7 @@ def BufferLoadOp : TT_AMDGPU_Op<"buffer_load", [
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
       oilist(`cacheModifier` `=` $cache)
       (`stride` `=` $stride^)?
+      (`validBytes` `=` $validBytes^)?
       attr-dict `:` type($result)
     }];
 }
@@ -359,6 +361,7 @@ def BufferLoadToLocalOp : TT_AMDGPU_Op<"buffer_load_to_local", [
       Optional<TT_BoolTensor>:$mask,
       Optional<TT_Tensor>:$other,
       Optional<I32>:$stride,
+      Optional<I64>:$validBytes,
       DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::NONE">:$cache,
       DefaultValuedAttr<I32Attr, "1">:$contiguity
     );
@@ -368,6 +371,7 @@ def BufferLoadToLocalOp : TT_AMDGPU_Op<"buffer_load_to_local", [
 
     let assemblyFormat = [{
       $ptr `[` $offsets `]` (`mask` `=` $mask^)? (`other` `=` $other^)? (`stride` `=` $stride^)?
+      (`validBytes` `=` $validBytes^)?
       oilist(`cacheModifier` `=` $cache) `into` $dest
       attr-dict `:` type($ptr) `[` type($offsets) `]` type($other) `->` type($dest)
     }];

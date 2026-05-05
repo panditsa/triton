@@ -2509,6 +2509,32 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 
 @gluon.jit
+def buffer_descriptor_kernel(ptr):
+    blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [32, 2], [4, 1], [1, 0])
+    shared: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+
+    smem = ttgl.allocate_shared_memory(ptr.dtype.element_ty, [128, 16], shared)
+    y_offset = ttgl.arange(0, 128, layout=ttgl.SliceLayout(1, blocked))
+    x_offset = ttgl.arange(0, 16, layout=ttgl.SliceLayout(0, blocked))
+    offsets = y_offset[:, None] * 16 + x_offset[None, :]
+    desc = ttgl.amd.cdna4.make_buffer_descriptor(ptr, (128, 16), (16, 1))
+
+    _ = ttgl.amd.cdna4.buffer_load(desc, offsets)
+    cdna4_async_copy.buffer_load_to_shared(smem, desc, offsets)
+
+
+@pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])
+def test_buffer_descriptor_frontend(target):
+    ptr = MockTensor(ttgl.float16)
+    mod = run_parser(buffer_descriptor_kernel, *make_args(ptr), target=target)
+    ir = anonymize_ir(mod.str_nodebug())
+
+    assert "amdg.buffer_load %arg0" in ir
+    assert "amdg.buffer_load_to_local %arg0" in ir
+    assert ir.count("validBytes =") == 2
+
+
+@gluon.jit
 def buffer_load_store_kernel(x, y):
     layout: ttgl.constexpr = ttgl.BlockedLayout(size_per_thread=[1, 1], threads_per_warp=[1, 64], warps_per_cta=[4, 1],
                                                 order=[1, 0])

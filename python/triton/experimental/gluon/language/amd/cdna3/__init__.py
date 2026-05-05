@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 from triton import knobs
 from triton.experimental.gluon.language import _core as ttgl
 from triton._C.libtriton import ir
+from triton.language.core import _aggregate as aggregate
 from ..._core import builtin, _unwrap_if_constexpr
 
 if TYPE_CHECKING:
@@ -11,7 +12,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "buffer_atomic_add", "buffer_atomic_and", "buffer_atomic_min", "buffer_atomic_max", "buffer_atomic_or",
-    "buffer_atomic_xor", "buffer_atomic_xor", "buffer_load", "buffer_store", "mfma"
+    "buffer_atomic_xor", "buffer_atomic_xor", "BufferDescriptor", "make_buffer_descriptor", "buffer_load",
+    "buffer_store", "mfma"
 ]
 
 _atomic_op_str_to_op = {
@@ -29,6 +31,59 @@ def _verify_buffer_ops(ptr, offsets, mask=None, other=None):
 
     if other is not None:
         assert mask is not None, "when other is not None, mask should not be None"
+
+
+@aggregate
+class BufferDescriptor:
+    base: ttgl.tensor
+    shape: ttgl.tuple
+    strides: ttgl.tuple
+    valid_bytes: ttgl.tensor
+
+
+def _canonicalize_buffer_desc_tuple(values, dtype, name, _semantic):
+    values = _unwrap_if_constexpr(values)
+    assert hasattr(values, "__iter__"), f"{name} must be a sequence"
+    return ttgl.tuple([_semantic.make_scalar(_unwrap_if_constexpr(value), dtype) for value in values])
+
+
+@builtin
+def make_buffer_descriptor(ptr, shape, strides, valid_bytes=None, _semantic=None):
+    """
+    Build a linear AMD buffer descriptor for buffer_load and buffer_load_to_shared.
+
+    `shape` and `strides` describe the physical allocation region. Offsets passed
+    to buffer ops remain element offsets relative to `ptr`.
+    """
+    assert ptr.type.is_ptr(), "ptr must be a scalar pointer type"
+    shape = _canonicalize_buffer_desc_tuple(shape, ttgl.int32, "shape", _semantic)
+    strides = _canonicalize_buffer_desc_tuple(strides, ttgl.int64, "strides", _semantic)
+    assert len(shape) == len(strides), "shape and strides must have the same rank"
+    assert len(shape) > 0, "shape and strides must describe at least one dimension"
+
+    if valid_bytes is None:
+        extent = _semantic.make_scalar(0, ttgl.int64)
+        one = _semantic.make_scalar(1, ttgl.int64)
+        for dim, stride in zip(shape, strides):
+            dim_i64 = _semantic.cast(dim, ttgl.int64)
+            dim_extent = _semantic.sub(dim_i64, one, sanitize_overflow=False)
+            dim_extent = _semantic.mul(dim_extent, stride, sanitize_overflow=False)
+            extent = _semantic.add(extent, dim_extent, sanitize_overflow=False)
+        elem_bits = ptr.type.scalar.element_ty.primitive_bitwidth
+        elem_bytes = max(8, elem_bits) // 8
+        elem_bytes = _semantic.make_scalar(elem_bytes, ttgl.int64)
+        valid_bytes = _semantic.add(extent, one, sanitize_overflow=False)
+        valid_bytes = _semantic.mul(valid_bytes, elem_bytes, sanitize_overflow=False)
+    else:
+        valid_bytes = _semantic.make_scalar(_unwrap_if_constexpr(valid_bytes), ttgl.int64)
+
+    return BufferDescriptor(ptr, shape, strides, valid_bytes, _semantic=_semantic)
+
+
+def _unwrap_buffer_descriptor(ptr):
+    if isinstance(ptr, BufferDescriptor):
+        return ptr.base, ptr.valid_bytes
+    return ptr, None
 
 
 def _verify_element_type_and_dispatch_op(op, elem_type, arch):
@@ -105,6 +160,7 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         other (tensor or scalar, optional): Tensor or scalar providing default values for masked elements. Defaults to None.
         cache_modifier (str): Cache modifier specifier. Defaults to "".
     """
+    ptr, valid_bytes = _unwrap_buffer_descriptor(ptr)
     _verify_buffer_ops(ptr, offsets, mask, other)
 
     mask = _unwrap_if_constexpr(mask)
@@ -119,11 +175,13 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
 
     other = other.handle if other is not None else ir.value()
     mask = mask.handle if mask is not None else ir.value()
+    valid_bytes = valid_bytes.handle if valid_bytes is not None else ir.value()
     cache_modifier = _semantic._str_to_load_cache_modifier(cache) if cache is not None else ir.CACHE_MODIFIER.NONE
 
     ret_ty = offsets.type.with_element_ty(ptr.type.scalar.element_ty)
     builder = _semantic.builder
-    handle = builder.create_buffer_load(ret_ty.to_ir(builder), ptr.handle, offsets.handle, mask, other, cache_modifier)
+    handle = builder.create_buffer_load(ret_ty.to_ir(builder), ptr.handle, offsets.handle, mask, other, valid_bytes,
+                                        cache_modifier)
     return ttgl.tensor(handle, ret_ty)
 
 

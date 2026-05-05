@@ -1,7 +1,7 @@
 from ..._core import ir, builtin, _unwrap_if_constexpr
 from ..._semantic import _check
 from ..._layouts import DistributedLayout
-from ..cdna3 import _verify_buffer_ops
+from ..cdna3 import _unwrap_buffer_descriptor, _verify_buffer_ops
 
 __all__ = [
     "global_load_to_shared",
@@ -105,6 +105,7 @@ def buffer_load_to_shared(dest, ptr, offsets, mask=None, other=None, cache_modif
     """
     _check(isinstance(offsets.type.layout, DistributedLayout),
            lambda: "expected offsets type layout to be a DistributedLayout")
+    ptr, valid_bytes = _unwrap_buffer_descriptor(ptr)
     _verify_buffer_ops(ptr, offsets, mask, other)
 
     mask = _unwrap_if_constexpr(mask)
@@ -118,11 +119,13 @@ def buffer_load_to_shared(dest, ptr, offsets, mask=None, other=None, cache_modif
 
     mask = mask.handle if mask is not None else ir.value()
     other = other.handle if other is not None else ir.value()
+    valid_bytes = valid_bytes.handle if valid_bytes is not None else ir.value()
     stride = ir.value()
     cache_modifier = _semantic._str_to_load_cache_modifier(cache_modifier)
     contiguity = _unwrap_if_constexpr(contiguity)
 
     _semantic.builder.create_buffer_load_to_local(dest.handle, ptr.handle, offsets.handle, mask, other, stride,
+                                                  valid_bytes,
                                                   cache_modifier, contiguity)
 
 

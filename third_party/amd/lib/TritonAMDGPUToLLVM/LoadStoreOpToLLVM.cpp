@@ -642,6 +642,7 @@ struct BufferLoadOpConversion
     Value llMask = adaptor.getMask();
     Value llOther = adaptor.getOther();
     Value llStride = adaptor.getStride();
+    Value llValidBytes = adaptor.getValidBytes();
 
     // Determine the vectorization size
     Type valueTy = op.getType();
@@ -667,7 +668,8 @@ struct BufferLoadOpConversion
       otherElems = unpackLLElements(loc, llOther, rewriter);
 
     // Create the resource descriptor and then emit the buffer_load intrinsic(s)
-    Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
+    Value rsrcDesc =
+        bufferEmitter.createResourceDescriptor(llPtr, llStride, llValidBytes);
     SmallVector<Value> loadedVals;
     Type vecTy = LLVM::getVectorType(valueElemTy, vec);
     for (size_t vecStart = 0; vecStart < numElems; vecStart += vec) {
@@ -725,6 +727,7 @@ struct BufferLoadToLocalOpConversion
     Value llMask = adaptor.getMask();
     Value llOther = adaptor.getOther();
     Value llStride = adaptor.getStride();
+    Value llValidBytes = adaptor.getValidBytes();
 
     RankedTensorType ptrType =
         cast<RankedTensorType>(getPointerTypeWithShape(ptr, offset));
@@ -788,7 +791,8 @@ struct BufferLoadToLocalOpConversion
 
     // Create the resource descriptor and then emit the buffer_loads to lds
     // based on the collected shared addresses and vector size
-    Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
+    Value rsrcDesc =
+        bufferEmitter.createResourceDescriptor(llPtr, llStride, llValidBytes);
 
     Value threadPred = emitRedundantThreadPredicateNonNull(
         getFreeVariableMasks(ptrType), rewriter, loc, targetInfo);
