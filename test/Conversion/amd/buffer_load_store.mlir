@@ -59,6 +59,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
 
 #blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+    // CHECK-LABEL: buffer_load_lowering_uniform_mul_split
+    tt.func @buffer_load_lowering_uniform_mul_split(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %base_offset : i32, %stride : i32) {
+        %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked0>
+        %base = tt.splat %base_offset : i32 -> tensor<128xi32, #blocked0>
+        %sum = arith.addi %base, %range : tensor<128xi32, #blocked0>
+        %stride_splat = tt.splat %stride : i32 -> tensor<128xi32, #blocked0>
+        %offset = arith.muli %sum, %stride_splat : tensor<128xi32, #blocked0>
+        // CHECK: rocdl.make.buffer.rsrc
+        // CHECK: %[[UNIFORM:.*]] = llvm.mul {{.*}} : i32
+        // CHECK: %[[PER_LANE:.*]] = llvm.mul {{.*}} : i32
+        // CHECK: %[[SOFFSET:.*]] = llvm.mul {{.*}}%[[UNIFORM]] : i32
+        // CHECK: %[[VOFFSET:.*]] = llvm.mul {{.*}}%[[PER_LANE]] : i32
+        // CHECK: %[[MASKED:.*]] = llvm.select {{.*}}, %[[VOFFSET]]
+        // CHECK: rocdl.raw.ptr.buffer.load {{.*}}, %[[MASKED]], %[[SOFFSET]]
+        %ret = amdg.buffer_load %arg0[%offset] : tensor<128xf32, #blocked0>
+        tt.return
+  }
+}
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     // CHECK-LABEL: buffer_load_same_target_cond_br_mixed_offset
     tt.func @buffer_load_same_target_cond_br_mixed_offset(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %base_offset : i32, %N : i32) {
         %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked0>
