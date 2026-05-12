@@ -345,6 +345,59 @@ Artifact: `benchmarking_mxfp4_kerns/perf_head_with_pipeline_fix.md` and
    doesn't carry; the right place is probably `AxisInfoAnalysis` which
    already tracks divisibility for pointer alignment.
 
+## 2026-05-12 frontend-only validation
+
+Validation branch: `experimental-mlir-fix` at `ff9c639589`.
+
+This run checked whether the frontend-only `ConvertToBufferOps.cpp`
+change reproduces the experimental branch's assembly effect without an
+LLVM-level pass. It does not yet match experimental. The pass now
+partially moves uniform offset work into `soffset` for the pingpong GEMM
+variants, but remains too conservative for the full experimental effect
+and is still base-like for `v4_addr_simpl` and FA.
+
+| kernel | experimental target | current frontend-only result |
+| ------ | ------------------- | ---------------------------- |
+| `v3` | `total=186`, `soffset=0`, `v_add=22` | matches: `total=186`, `soffset=0`, `v_add=22` |
+| `v3_pingpong` | `total=160`, `soffset=28`, `v_add=3` | partial: `total=172`, `soffset=20`, `v_add=11` |
+| `v3_pingpong_triple_lds` | `total=180`, `soffset=28`, `v_add=7` | partial: `total=190`, `soffset=20`, `v_add=15` |
+| `v4_addr_simpl` | `total=181`, `imm=10`, `v_add=0` | base-like: `total=182`, `imm=0`, `v_add=0` |
+| FA main loop | `total=542`, `soffset=8`, `v_add=8`, `v_mul=2` | base-like: `total=558`, `soffset=0`, `v_add=15`, `v_mul=10` |
+
+Full-kernel buffer-op split counts for the GEMM assembly dumps:
+
+| kernel | buffer ops | nonzero `soffset` | zero `soffset` | nonzero immediate |
+| ------ | ---------: | ----------------: | -------------: | ----------------: |
+| `v3` | 72 | 0 | 72 | 0 |
+| `v3_pingpong` | 72 | 40 | 32 | 0 |
+| `v3_pingpong_triple_lds` | 100 | 20 | 80 | 0 |
+| `v4_addr_simpl` | 72 | 0 | 72 | 0 |
+
+Diagnostics explain the gap:
+
+- `v3_pingpong*`: the frontend pass splits some `divui` / `remui`
+  forms, but still bails on `tt.make_range` / `arith.remsi` leaves
+  because the per-lane component is not proven non-negative.
+- FA: the hot loop is still effectively base-like. The debug trace shows
+  the same non-negativity bailouts in inner functions, and the top-level
+  FA offset still exposes no useful uniform leaves for the current
+  frontend walker.
+
+Performance was also run, but the machine was not idle: `rocm-smi`
+reported all GPUs at 100% utilization before the sweep. The GEMM sweep
+completed `95/95`, but the resulting CSV is not comparable to the
+idle-GPU numbers in this file. The contended run measured roughly 3x
+slower geomean than the saved idle CSVs, which should be treated as
+machine contention rather than a compiler regression. FA quick completed
+at `583.9 TFLOPS / 1.412 ms`, also under contention.
+
+Artifacts:
+
+- `benchmarking_mxfp4_kerns/asm/experimental_mlir_fix_frontend/`
+- `benchmarking_mxfp4_kerns/perf_experimental_mlir_fix_frontend.csv`
+- `benchmarking_mxfp4_kerns/asm/fa_experimental_mlir_fix_frontend/`
+- `benchmarking_mxfp4_kerns/fa_experimental_mlir_fix_frontend_quick.json`
+
 ## Reproducibility
 
 ```bash
