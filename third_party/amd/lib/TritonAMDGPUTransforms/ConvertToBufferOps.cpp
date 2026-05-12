@@ -21,8 +21,10 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #undef DEBUG_TYPE
 #define DEBUG_TYPE "tritonamdgpu-convert-buffer-ops"
@@ -195,6 +197,32 @@ bool collectSplatThroughTensorTrunc(Value offset,
   return true;
 }
 
+// Env-gated diagnostic for the MLIR-level walker. Set
+// TRITON_AMD_BUFFER_OPS_DEBUG=1 to enable.
+static bool mlirWalkerDebug() {
+  static int cached = -1;
+  if (cached == -1) {
+    const char *v = std::getenv("TRITON_AMD_BUFFER_OPS_DEBUG");
+    cached = (v && v[0] != 0 && v[0] != '0') ? 1 : 0;
+  }
+  return cached == 1;
+}
+
+static std::string describeMlirValue(Value v) {
+  std::string s;
+  llvm::raw_string_ostream os(s);
+  if (Operation *def = v.getDefiningOp()) {
+    os << def->getName().getStringRef();
+  } else if (auto ba = dyn_cast<BlockArgument>(v)) {
+    os << "BlockArg#" << ba.getArgNumber();
+    if (auto p = ba.getOwner()->getParentOp())
+      os << "(in " << p->getName().getStringRef() << ")";
+  } else {
+    os << "<unknown>";
+  }
+  return s;
+}
+
 std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
                                                    PatternRewriter &rewriter,
                                                    DataFlowSolver *solver) {
@@ -206,7 +234,28 @@ std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
     collectHighLevelOffsetLeaves(offset, uniformLeaves, perLaneLeaves,
                                  uniformity, rewriter);
 
+  size_t uBefore = uniformLeaves.size();
   llvm::erase_if(uniformLeaves, isScalarLiteralZero);
+  if (mlirWalkerDebug()) {
+    StringRef fnName = "<unknown>";
+    if (Operation *parent = rewriter.getInsertionBlock()
+                                ? rewriter.getInsertionBlock()->getParentOp()
+                                : nullptr) {
+      Operation *cur = parent;
+      while (cur && !isa<FunctionOpInterface>(cur))
+        cur = cur->getParentOp();
+      if (cur) {
+        if (auto sym = cur->getAttrOfType<StringAttr>("sym_name"))
+          fnName = sym.getValue();
+      }
+    }
+    llvm::errs() << "[mlir-soffset] fn=" << fnName << "  offset_root="
+                 << describeMlirValue(offset) << "  u=" << uniformLeaves.size()
+                 << " (was " << uBefore << ")  pl=" << perLaneLeaves.size();
+    for (Value pl : perLaneLeaves)
+      llvm::errs() << "  pl_kind=" << describeMlirValue(pl);
+    llvm::errs() << "\n";
+  }
   if (uniformLeaves.empty())
     return {offset, Value()};
 
@@ -216,9 +265,14 @@ std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
   // negative, wrap to a huge unsigned, and OOB-drop the access. Only split
   // when every per-lane leaf is provably non-negative.
   auto nonNegative = [&](Value v) { return isProvenNonNegative(v, solver); };
-  if (!llvm::all_of(perLaneLeaves, nonNegative))
+  if (!llvm::all_of(perLaneLeaves, nonNegative)) {
+    if (mlirWalkerDebug())
+      llvm::errs() << "[mlir-soffset]   bail: per-lane leaf not provably non-negative\n";
     return {offset, Value()};
+  }
 
+  if (mlirWalkerDebug())
+    llvm::errs() << "[mlir-soffset]   -> SPLIT\n";
   Location loc = offset.getLoc();
   Value uniform = sumIntegerValues(uniformLeaves, rewriter, loc);
   Value perLane = perLaneLeaves.empty()
