@@ -6,7 +6,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "BufferOpsEmitter.h"
-#include "OffsetUniformitySplit.h"
 
 using namespace triton::AMD;
 
@@ -281,25 +280,13 @@ void BufferEmitter::fillCommonArgs(Type type, Value rsrcDesc,
   Value vOffsetOutOfBunds = b.int_val(
       32, static_cast<int>(std::numeric_limits<int>::max() + int64_t(1)));
 
-  // 2. Convert the explicit soffset, then let the LLVM-level splitter catch
-  // any uniform additive component that survived high-level buffer-op cleanup.
+  // 2. Convert the pre-split voffset/soffset element offsets to bytes. The
+  // intrinsic computes `addr = base + voffset + soffset` per-lane.
   Value elemByteWidthVal = b.int_val(32, elementByteWidth);
-  Value vOffsetElemsForIntrinsic = vOffsetElems;
-  Value sOffsetElemsForIntrinsic = sOffsetElems;
-  auto [uniformOffsetElems, perLaneOffsetElems] =
-      splitUniformAdditive(vOffsetElems, rewriter, loc);
-  if (uniformOffsetElems) {
-    sOffsetElemsForIntrinsic =
-        sOffsetElemsForIntrinsic
-            ? b.add(sOffsetElemsForIntrinsic, uniformOffsetElems).getResult()
-            : uniformOffsetElems;
-    vOffsetElemsForIntrinsic = perLaneOffsetElems;
-  }
-
   Value sgprOffsetBytes = b.int_val(32, 0);
-  if (sOffsetElemsForIntrinsic)
-    sgprOffsetBytes = b.mul(elemByteWidthVal, sOffsetElemsForIntrinsic);
-  Value vOffsetBytes = b.mul(elemByteWidthVal, vOffsetElemsForIntrinsic);
+  if (sOffsetElems)
+    sgprOffsetBytes = b.mul(elemByteWidthVal, sOffsetElems);
+  Value vOffsetBytes = b.mul(elemByteWidthVal, vOffsetElems);
 
   // Keep masked lanes OOB in the voffset field itself because AMD buffer bounds
   // checks do not include soffset.

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 
 #undef DEBUG_TYPE
 #define DEBUG_TYPE "tritonamdgpu-convert-buffer-ops"
@@ -58,15 +59,6 @@ bool isSplatOneConstTensor(const Value v) {
   return false;
 }
 
-bool isScalarLiteralZero(Value v) {
-  auto constantOp = v.getDefiningOp<arith::ConstantOp>();
-  if (!constantOp)
-    return false;
-  if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue()))
-    return intAttr.getValue().isZero();
-  return false;
-}
-
 // Returns true iff `solver` has a non-empty range for `v` whose minimum
 // signed value is non-negative.
 bool isProvenNonNegative(Value v, DataFlowSolver *solver) {
@@ -97,6 +89,21 @@ Value createZeroTensorLike(Value tensor, PatternRewriter &rewriter,
                                    rewriter.getZeroAttr(tensorTy));
 }
 
+std::optional<APInt> getIntegerConstant(Value value) {
+  auto constantOp = value.getDefiningOp<arith::ConstantOp>();
+  if (!constantOp)
+    return std::nullopt;
+
+  Attribute attr = constantOp.getValue();
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getValue();
+  if (auto denseAttr = dyn_cast<DenseIntElementsAttr>(attr)) {
+    if (denseAttr.isSplat())
+      return denseAttr.getSplatValue<APInt>();
+  }
+  return std::nullopt;
+}
+
 class HighLevelUniformityChecker {
 public:
   bool isUniform(Value value) {
@@ -119,6 +126,13 @@ private:
 
     if (isa<arith::ConstantOp, tt::GetProgramIdOp, tt::GetNumProgramsOp>(def))
       return true;
+
+    if (isa<tt::SplatOp, tt::BroadcastOp, tt::ExpandDimsOp>(def)) {
+      for (Value operand : def->getOperands())
+        if (!isUniform(operand))
+          return false;
+      return true;
+    }
 
     if (isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ShLIOp,
             arith::ShRSIOp, arith::ShRUIOp, arith::AndIOp, arith::OrIOp,
@@ -154,46 +168,298 @@ private:
   DenseMap<Value, bool> cache;
 };
 
-void collectHighLevelOffsetLeaves(Value offset,
-                                  SmallVectorImpl<Value> &uniformLeaves,
-                                  SmallVectorImpl<Value> &perLaneLeaves,
-                                  HighLevelUniformityChecker &uniformity,
-                                  PatternRewriter &rewriter) {
-  if (auto addOp = offset.getDefiningOp<arith::AddIOp>()) {
-    collectHighLevelOffsetLeaves(addOp.getLhs(), uniformLeaves, perLaneLeaves,
-                                 uniformity, rewriter);
-    collectHighLevelOffsetLeaves(addOp.getRhs(), uniformLeaves, perLaneLeaves,
-                                 uniformity, rewriter);
-    return;
-  }
-  if (auto splatOp = offset.getDefiningOp<triton::SplatOp>()) {
-    if (uniformity.isUniform(splatOp.getSrc()))
-      uniformLeaves.push_back(splatOp.getSrc());
-    else
-      perLaneLeaves.push_back(offset);
-    return;
-  }
-  perLaneLeaves.push_back(offset);
+struct TensorProjection {
+  enum class Kind { Broadcast, ExpandDims };
+
+  Kind kind;
+  RankedTensorType resultType;
+  uint32_t axis = 0;
+};
+
+struct HighLevelOffsetLeaf {
+  Value value;
+  APInt constMul;
+  SmallVector<Value, 2> dynMuls;
+  SmallVector<TensorProjection, 4> projections;
+};
+
+SmallVector<TensorProjection, 4>
+appendProjection(ArrayRef<TensorProjection> projections,
+                 TensorProjection projection) {
+  SmallVector<TensorProjection, 4> result(projections.begin(),
+                                          projections.end());
+  result.push_back(projection);
+  return result;
 }
 
-bool collectSplatThroughTensorTrunc(Value offset,
-                                    SmallVectorImpl<Value> &uniformLeaves,
-                                    HighLevelUniformityChecker &uniformity,
-                                    PatternRewriter &rewriter) {
-  auto truncOp = offset.getDefiningOp<arith::TruncIOp>();
-  if (!truncOp)
-    return false;
-  auto splatOp = truncOp.getIn().getDefiningOp<triton::SplatOp>();
-  if (!splatOp || !uniformity.isUniform(splatOp.getSrc()))
+Value getUniformScalar(Value value, HighLevelUniformityChecker &uniformity) {
+  if (!isa<RankedTensorType>(value.getType()) && uniformity.isUniform(value))
+    return value;
+
+  if (auto splatOp = value.getDefiningOp<tt::SplatOp>()) {
+    if (uniformity.isUniform(splatOp.getSrc()))
+      return splatOp.getSrc();
+  }
+  if (auto broadcastOp = value.getDefiningOp<tt::BroadcastOp>())
+    return getUniformScalar(broadcastOp.getSrc(), uniformity);
+  if (auto expandOp = value.getDefiningOp<tt::ExpandDimsOp>())
+    return getUniformScalar(expandOp.getSrc(), uniformity);
+  if (auto truncOp = value.getDefiningOp<arith::TruncIOp>())
+    return getUniformScalar(truncOp.getIn(), uniformity);
+  return Value();
+}
+
+void collectHighLevelOffsetLeaves(
+    Value offset, APInt constMul, ArrayRef<Value> dynMuls,
+    ArrayRef<TensorProjection> projections,
+    SmallVectorImpl<HighLevelOffsetLeaf> &uniformLeaves,
+    SmallVectorImpl<HighLevelOffsetLeaf> &perLaneLeaves,
+    HighLevelUniformityChecker &uniformity) {
+  if (auto addOp = offset.getDefiningOp<arith::AddIOp>()) {
+    collectHighLevelOffsetLeaves(addOp.getLhs(), constMul, dynMuls,
+                                 projections, uniformLeaves, perLaneLeaves,
+                                 uniformity);
+    collectHighLevelOffsetLeaves(addOp.getRhs(), constMul, dynMuls,
+                                 projections, uniformLeaves, perLaneLeaves,
+                                 uniformity);
+    return;
+  }
+
+  if (auto broadcastOp = offset.getDefiningOp<tt::BroadcastOp>()) {
+    auto nextProjections = appendProjection(
+        projections,
+        {TensorProjection::Kind::Broadcast, broadcastOp.getType(), 0});
+    collectHighLevelOffsetLeaves(broadcastOp.getSrc(), constMul, dynMuls,
+                                 nextProjections, uniformLeaves, perLaneLeaves,
+                                 uniformity);
+    return;
+  }
+
+  if (auto expandOp = offset.getDefiningOp<tt::ExpandDimsOp>()) {
+    auto nextProjections = appendProjection(
+        projections,
+        {TensorProjection::Kind::ExpandDims, expandOp.getType(),
+         expandOp.getAxis()});
+    collectHighLevelOffsetLeaves(expandOp.getSrc(), constMul, dynMuls,
+                                 nextProjections, uniformLeaves, perLaneLeaves,
+                                 uniformity);
+    return;
+  }
+
+  if (auto mulOp = offset.getDefiningOp<arith::MulIOp>()) {
+    Value lhs = mulOp.getLhs();
+    Value rhs = mulOp.getRhs();
+    auto lhsConst = getIntegerConstant(lhs);
+    auto rhsConst = getIntegerConstant(rhs);
+    if (rhsConst && !lhsConst) {
+      collectHighLevelOffsetLeaves(lhs,
+                                   constMul *
+                                       rhsConst->sextOrTrunc(
+                                           constMul.getBitWidth()),
+                                   dynMuls, projections, uniformLeaves,
+                                   perLaneLeaves, uniformity);
+      return;
+    }
+    if (lhsConst && !rhsConst) {
+      collectHighLevelOffsetLeaves(rhs,
+                                   constMul *
+                                       lhsConst->sextOrTrunc(
+                                           constMul.getBitWidth()),
+                                   dynMuls, projections, uniformLeaves,
+                                   perLaneLeaves, uniformity);
+      return;
+    }
+
+    Value lhsUniform = getUniformScalar(lhs, uniformity);
+    Value rhsUniform = getUniformScalar(rhs, uniformity);
+    if (lhsUniform && rhsUniform) {
+      SmallVector<Value, 2> nextDyn(dynMuls.begin(), dynMuls.end());
+      nextDyn.push_back(lhsUniform);
+      uniformLeaves.push_back({rhsUniform, constMul, nextDyn,
+                               SmallVector<TensorProjection, 4>(
+                                   projections.begin(), projections.end())});
+      return;
+    }
+    if (lhsUniform && !rhsUniform) {
+      SmallVector<Value, 2> nextDyn(dynMuls.begin(), dynMuls.end());
+      nextDyn.push_back(lhsUniform);
+      collectHighLevelOffsetLeaves(rhs, constMul, nextDyn, projections,
+                                   uniformLeaves, perLaneLeaves, uniformity);
+      return;
+    }
+    if (rhsUniform && !lhsUniform) {
+      SmallVector<Value, 2> nextDyn(dynMuls.begin(), dynMuls.end());
+      nextDyn.push_back(rhsUniform);
+      collectHighLevelOffsetLeaves(lhs, constMul, nextDyn, projections,
+                                   uniformLeaves, perLaneLeaves, uniformity);
+      return;
+    }
+  }
+
+  if (auto shlOp = offset.getDefiningOp<arith::ShLIOp>()) {
+    if (auto shift = getIntegerConstant(shlOp.getRhs())) {
+      uint64_t shiftAmount = shift->getZExtValue();
+      if (shiftAmount < constMul.getBitWidth()) {
+        APInt scale = APInt(constMul.getBitWidth(), 1) << shiftAmount;
+        collectHighLevelOffsetLeaves(shlOp.getLhs(), constMul * scale,
+                                     dynMuls, projections, uniformLeaves,
+                                     perLaneLeaves, uniformity);
+        return;
+      }
+    }
+  }
+
+  if (Value uniformScalar = getUniformScalar(offset, uniformity)) {
+    uniformLeaves.push_back({uniformScalar, constMul,
+                             SmallVector<Value, 2>(dynMuls.begin(),
+                                                   dynMuls.end()),
+                             SmallVector<TensorProjection, 4>(
+                                 projections.begin(), projections.end())});
+    return;
+  }
+
+  perLaneLeaves.push_back({offset, constMul,
+                           SmallVector<Value, 2>(dynMuls.begin(),
+                                                 dynMuls.end()),
+                           SmallVector<TensorProjection, 4>(
+                               projections.begin(), projections.end())});
+}
+
+Value castScalarInteger(Value value, Type targetType,
+                        PatternRewriter &rewriter, Location loc) {
+  if (value.getType() == targetType)
+    return value;
+  if (value.getType().isIndex() || targetType.isIndex())
+    return arith::IndexCastOp::create(rewriter, loc, targetType, value);
+
+  auto srcType = cast<IntegerType>(value.getType());
+  auto dstType = cast<IntegerType>(targetType);
+  if (srcType.getWidth() > dstType.getWidth())
+    return arith::TruncIOp::create(rewriter, loc, targetType, value);
+  return arith::ExtSIOp::create(rewriter, loc, targetType, value);
+}
+
+Value createIntegerConstantLike(Type resultType, APInt value,
+                                PatternRewriter &rewriter, Location loc) {
+  Type scalarType = getElementTypeOrSelf(resultType);
+  unsigned width = scalarType.isIndex()
+                       ? value.getBitWidth()
+                       : cast<IntegerType>(scalarType).getWidth();
+  Value scalar = arith::ConstantOp::create(
+      rewriter, loc, scalarType,
+      rewriter.getIntegerAttr(scalarType, value.sextOrTrunc(width)));
+  if (auto tensorType = dyn_cast<RankedTensorType>(resultType))
+    return tt::SplatOp::create(rewriter, loc, tensorType, scalar);
+  return scalar;
+}
+
+Value materializeScalarFactorLike(Value factor, Type resultType,
+                                  PatternRewriter &rewriter, Location loc) {
+  Type scalarType = getElementTypeOrSelf(resultType);
+  factor = castScalarInteger(factor, scalarType, rewriter, loc);
+  if (auto tensorType = dyn_cast<RankedTensorType>(resultType))
+    return tt::SplatOp::create(rewriter, loc, tensorType, factor);
+  return factor;
+}
+
+Value materializeHighLevelLeaf(const HighLevelOffsetLeaf &leaf,
+                               PatternRewriter &rewriter, Location loc,
+                               bool applyProjections) {
+  Value result = leaf.value;
+  if (leaf.constMul != 1) {
+    Value factor =
+        createIntegerConstantLike(result.getType(), leaf.constMul, rewriter,
+                                  loc);
+    result = arith::MulIOp::create(rewriter, loc, result, factor);
+  }
+  for (Value dynMul : leaf.dynMuls) {
+    Value factor =
+        materializeScalarFactorLike(dynMul, result.getType(), rewriter, loc);
+    result = arith::MulIOp::create(rewriter, loc, result, factor);
+  }
+
+  if (!applyProjections)
+    return result;
+
+  for (auto it = leaf.projections.rbegin(); it != leaf.projections.rend();
+       ++it) {
+    if (it->kind == TensorProjection::Kind::Broadcast) {
+      result =
+          tt::BroadcastOp::create(rewriter, loc, it->resultType, result);
+      continue;
+    }
+    result = tt::ExpandDimsOp::create(rewriter, loc, result, it->axis);
+  }
+  return result;
+}
+
+bool isZeroLeaf(const HighLevelOffsetLeaf &leaf) {
+  if (leaf.constMul.isZero())
+    return true;
+  if (auto constant = getIntegerConstant(leaf.value))
+    return constant->isZero();
+  return false;
+}
+
+bool isKnownNonNegative(Value value, DataFlowSolver *solver,
+                        DenseSet<Value> &active) {
+  if (isProvenNonNegative(value, solver))
+    return true;
+  if (!active.insert(value).second)
     return false;
 
-  auto resultTy = cast<RankedTensorType>(truncOp.getResult().getType());
-  Type scalarTy = resultTy.getElementType();
-  Value scalar = splatOp.getSrc();
-  if (scalar.getType() != scalarTy)
-    scalar =
-        arith::TruncIOp::create(rewriter, offset.getLoc(), scalarTy, scalar);
-  uniformLeaves.push_back(scalar);
+  if (auto constant = getIntegerConstant(value))
+    return !constant->isNegative();
+
+  if (auto makeRangeOp = value.getDefiningOp<tt::MakeRangeOp>())
+    return makeRangeOp.getStartAttr().getInt() >= 0;
+  if (auto splatOp = value.getDefiningOp<tt::SplatOp>())
+    return isKnownNonNegative(splatOp.getSrc(), solver, active);
+  if (auto broadcastOp = value.getDefiningOp<tt::BroadcastOp>())
+    return isKnownNonNegative(broadcastOp.getSrc(), solver, active);
+  if (auto expandOp = value.getDefiningOp<tt::ExpandDimsOp>())
+    return isKnownNonNegative(expandOp.getSrc(), solver, active);
+  if (auto truncOp = value.getDefiningOp<arith::TruncIOp>())
+    return isKnownNonNegative(truncOp.getIn(), solver, active);
+  if (value.getDefiningOp<arith::ExtUIOp>())
+    return true;
+  if (auto extOp = value.getDefiningOp<arith::ExtSIOp>())
+    return isKnownNonNegative(extOp.getIn(), solver, active);
+  if (auto castOp = value.getDefiningOp<arith::IndexCastOp>())
+    return isKnownNonNegative(castOp.getIn(), solver, active);
+  if (value.getDefiningOp<arith::IndexCastUIOp>())
+    return true;
+  if (auto addOp = value.getDefiningOp<arith::AddIOp>())
+    return isKnownNonNegative(addOp.getLhs(), solver, active) &&
+           isKnownNonNegative(addOp.getRhs(), solver, active);
+  if (auto mulOp = value.getDefiningOp<arith::MulIOp>())
+    return isKnownNonNegative(mulOp.getLhs(), solver, active) &&
+           isKnownNonNegative(mulOp.getRhs(), solver, active);
+  if (auto shlOp = value.getDefiningOp<arith::ShLIOp>())
+    return isKnownNonNegative(shlOp.getLhs(), solver, active) &&
+           isKnownNonNegative(shlOp.getRhs(), solver, active);
+  if (auto andOp = value.getDefiningOp<arith::AndIOp>())
+    return isKnownNonNegative(andOp.getLhs(), solver, active) &&
+           isKnownNonNegative(andOp.getRhs(), solver, active);
+
+  return false;
+}
+
+bool isLeafProvenNonNegative(const HighLevelOffsetLeaf &leaf,
+                             DataFlowSolver *solver) {
+  if (leaf.constMul.isZero())
+    return true;
+  if (leaf.constMul.isNegative())
+    return false;
+
+  DenseSet<Value> active;
+  if (!isKnownNonNegative(leaf.value, solver, active))
+    return false;
+  for (Value dynMul : leaf.dynMuls) {
+    active.clear();
+    if (!isKnownNonNegative(dynMul, solver, active))
+      return false;
+  }
   return true;
 }
 
@@ -226,16 +492,20 @@ static std::string describeMlirValue(Value v) {
 std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
                                                    PatternRewriter &rewriter,
                                                    DataFlowSolver *solver) {
-  SmallVector<Value> uniformLeaves;
-  SmallVector<Value> perLaneLeaves;
+  Type scalarOffsetType = getElementTypeOrSelf(offset.getType());
+  unsigned width = 32;
+  if (auto intType = dyn_cast<IntegerType>(scalarOffsetType))
+    width = intType.getWidth();
+
+  SmallVector<HighLevelOffsetLeaf> uniformLeaves;
+  SmallVector<HighLevelOffsetLeaf> perLaneLeaves;
   HighLevelUniformityChecker uniformity;
-  if (!collectSplatThroughTensorTrunc(offset, uniformLeaves, uniformity,
-                                      rewriter))
-    collectHighLevelOffsetLeaves(offset, uniformLeaves, perLaneLeaves,
-                                 uniformity, rewriter);
+  collectHighLevelOffsetLeaves(offset, APInt(width, 1), ArrayRef<Value>{},
+                               ArrayRef<TensorProjection>{}, uniformLeaves,
+                               perLaneLeaves, uniformity);
 
   size_t uBefore = uniformLeaves.size();
-  llvm::erase_if(uniformLeaves, isScalarLiteralZero);
+  llvm::erase_if(uniformLeaves, isZeroLeaf);
   if (mlirWalkerDebug()) {
     StringRef fnName = "<unknown>";
     if (Operation *parent = rewriter.getInsertionBlock()
@@ -252,8 +522,8 @@ std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
     llvm::errs() << "[mlir-soffset] fn=" << fnName << "  offset_root="
                  << describeMlirValue(offset) << "  u=" << uniformLeaves.size()
                  << " (was " << uBefore << ")  pl=" << perLaneLeaves.size();
-    for (Value pl : perLaneLeaves)
-      llvm::errs() << "  pl_kind=" << describeMlirValue(pl);
+    for (const HighLevelOffsetLeaf &pl : perLaneLeaves)
+      llvm::errs() << "  pl_kind=" << describeMlirValue(pl.value);
     llvm::errs() << "\n";
   }
   if (uniformLeaves.empty())
@@ -264,7 +534,9 @@ std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
   // possibly-negative one in `voffset` would let some lane's `voffset` go
   // negative, wrap to a huge unsigned, and OOB-drop the access. Only split
   // when every per-lane leaf is provably non-negative.
-  auto nonNegative = [&](Value v) { return isProvenNonNegative(v, solver); };
+  auto nonNegative = [&](const HighLevelOffsetLeaf &leaf) {
+    return isLeafProvenNonNegative(leaf, solver);
+  };
   if (!llvm::all_of(perLaneLeaves, nonNegative)) {
     if (mlirWalkerDebug())
       llvm::errs() << "[mlir-soffset]   bail: per-lane leaf not provably non-negative\n";
@@ -274,10 +546,26 @@ std::pair<Value, Value> splitHighLevelBufferOffset(Value offset,
   if (mlirWalkerDebug())
     llvm::errs() << "[mlir-soffset]   -> SPLIT\n";
   Location loc = offset.getLoc();
-  Value uniform = sumIntegerValues(uniformLeaves, rewriter, loc);
-  Value perLane = perLaneLeaves.empty()
+  SmallVector<Value> uniformValues;
+  uniformValues.reserve(uniformLeaves.size());
+  for (const HighLevelOffsetLeaf &leaf : uniformLeaves) {
+    Value uniform = materializeHighLevelLeaf(leaf, rewriter, loc,
+                                             /*applyProjections=*/false);
+    uniformValues.push_back(
+        castScalarInteger(uniform, scalarOffsetType, rewriter, loc));
+  }
+
+  SmallVector<Value> perLaneValues;
+  perLaneValues.reserve(perLaneLeaves.size());
+  for (const HighLevelOffsetLeaf &leaf : perLaneLeaves) {
+    perLaneValues.push_back(materializeHighLevelLeaf(
+        leaf, rewriter, loc, /*applyProjections=*/true));
+  }
+
+  Value uniform = sumIntegerValues(uniformValues, rewriter, loc);
+  Value perLane = perLaneValues.empty()
                       ? createZeroTensorLike(offset, rewriter, loc)
-                      : sumIntegerValues(perLaneLeaves, rewriter, loc);
+                      : sumIntegerValues(perLaneValues, rewriter, loc);
   return {perLane, uniform};
 }
 

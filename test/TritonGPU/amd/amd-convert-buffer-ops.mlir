@@ -78,6 +78,56 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 #blocked_direct = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: direct_buffer_load_uniform_mul_soffset_split
+  tt.func @direct_buffer_load_uniform_mul_soffset_split(%arg0: !tt.ptr<f32>, %base_offset: i32, %stride: i32) -> tensor<64xf32, #blocked_direct> {
+    %c0_i32 = arith.constant 0 : i32
+    %stride_nonneg = arith.cmpi sge, %stride, %c0_i32 : i32
+    llvm.intr.assume %stride_nonneg : i1
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked_direct>
+    %base = tt.splat %base_offset : i32 -> tensor<64xi32, #blocked_direct>
+    %sum = arith.addi %base, %range : tensor<64xi32, #blocked_direct>
+    %stride_splat = tt.splat %stride : i32 -> tensor<64xi32, #blocked_direct>
+    %offset = arith.muli %sum, %stride_splat : tensor<64xi32, #blocked_direct>
+    // COMMON: %[[RANGE:.*]] = tt.make_range
+    // COMMON: %[[UNIFORM:.*]] = arith.muli %arg{{[0-9]+}}, %arg{{[0-9]+}}
+    // COMMON: %[[STRIDE_SPLAT:.*]] = tt.splat %arg{{[0-9]+}}
+    // COMMON: %[[PER_LANE:.*]] = arith.muli %[[RANGE]], %[[STRIDE_SPLAT]]
+    // COMMON: amdg.buffer_load %arg0[%[[PER_LANE]], %[[UNIFORM]]]
+    %loaded = amdg.buffer_load %arg0[%offset] : tensor<64xf32, #blocked_direct>
+    tt.return %loaded : tensor<64xf32, #blocked_direct>
+  }
+}
+
+// -----
+
+#blocked_bcast = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 64], warpsPerCTA = [1, 1], order = [1, 0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: direct_buffer_load_broadcast_soffset_split
+  tt.func @direct_buffer_load_broadcast_soffset_split(%arg0: !tt.ptr<f32>, %base_offset: i32) -> tensor<16x64xf32, #blocked_bcast> {
+    %rows = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_bcast}>>
+    %row_expanded = tt.expand_dims %rows {axis = 1 : i32} : tensor<16xi32, #ttg.slice<{dim = 1, parent = #blocked_bcast}>> -> tensor<16x1xi32, #blocked_bcast>
+    %row_offsets = tt.broadcast %row_expanded : tensor<16x1xi32, #blocked_bcast> -> tensor<16x64xi32, #blocked_bcast>
+    %cols = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_bcast}>>
+    %col_expanded = tt.expand_dims %cols {axis = 0 : i32} : tensor<64xi32, #ttg.slice<{dim = 0, parent = #blocked_bcast}>> -> tensor<1x64xi32, #blocked_bcast>
+    %col_offsets = tt.broadcast %col_expanded : tensor<1x64xi32, #blocked_bcast> -> tensor<16x64xi32, #blocked_bcast>
+    %base = tt.splat %base_offset : i32 -> tensor<16x64xi32, #blocked_bcast>
+    %tmp = arith.addi %base, %row_offsets : tensor<16x64xi32, #blocked_bcast>
+    %offset = arith.addi %tmp, %col_offsets : tensor<16x64xi32, #blocked_bcast>
+    // COMMON: %[[ROW_OFFSETS:.*]] = tt.broadcast
+    // COMMON: %[[COL_OFFSETS:.*]] = tt.broadcast
+    // COMMON: %[[PER_LANE:.*]] = arith.addi %[[ROW_OFFSETS]], %[[COL_OFFSETS]]
+    // COMMON: amdg.buffer_load %arg0[%[[PER_LANE]], %arg{{[0-9]+}}]
+    %loaded = amdg.buffer_load %arg0[%offset] : tensor<16x64xf32, #blocked_bcast>
+    tt.return %loaded : tensor<16x64xf32, #blocked_bcast>
+  }
+}
+
+// -----
+
+#blocked_direct = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   // COMMON-LABEL: direct_buffer_load_lane_splat_no_soffset_split
   tt.func @direct_buffer_load_lane_splat_no_soffset_split(%arg0: !tt.ptr<f32>) -> tensor<64xf32, #blocked_direct> {
     %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked_direct>
