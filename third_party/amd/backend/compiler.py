@@ -320,6 +320,20 @@ class HIPBackend(BaseBackend):
         amd.passes.ttgpuir.add_warp_pipeline(pm)
         passes.ttgpuir.add_allocate_warp_groups(pm)
 
+        # Run buffer-op patterns on gluon-emitted IR too. Gluon produces
+        # `amdgpu.buffer_load*` directly via `gl.amd.cdna4.buffer_load`, so
+        # the soffset-split rewrites get a chance to lift wave-uniform
+        # additive contributions out of voffset and into soffset on those
+        # ops as well as on tt.load-converted buffer ops.
+        if knobs.amd.use_buffer_ops:
+            amd.passes.ttgpuir.add_convert_to_buffer_ops(
+                pm,
+                options.arch,
+                knobs.amd.use_buffer_atomics,
+                knobs.amd.buffer_ops_analyze_small_tensor_range,
+            )
+            amd.passes.ttgpuir.add_optimize_buffer_op_ptr(pm)
+
         if options.instrumentation_mode == "fpsan" and is_fpsan_supported(options.arch):
             amd.passes.ttgpuir.add_fp_sanitizer(pm)
             passes.ttgpuir.add_fp_sanitizer(pm)
