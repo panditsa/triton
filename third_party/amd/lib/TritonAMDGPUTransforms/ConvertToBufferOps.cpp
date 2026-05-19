@@ -977,6 +977,11 @@ bool isKnownNonNegative(Value value, DataFlowSolver *solver,
   if (auto andOp = value.getDefiningOp<arith::AndIOp>())
     return isKnownNonNegative(andOp.getLhs(), solver, active) &&
            isKnownNonNegative(andOp.getRhs(), solver, active);
+  if (auto remOp = value.getDefiningOp<arith::RemSIOp>()) {
+    // `arith.remsi` follows the dividend's sign. A non-negative dividend
+    // therefore cannot produce a negative per-lane `voffset` component.
+    return isKnownNonNegative(remOp.getLhs(), solver, active);
+  }
 
   return false;
 }

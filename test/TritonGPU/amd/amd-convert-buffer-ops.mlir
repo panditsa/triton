@@ -273,6 +273,29 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
 #blocked_direct = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: direct_buffer_load_nested_remsi_nonnegative_soffset_split
+  tt.func @direct_buffer_load_nested_remsi_nonnegative_soffset_split(%arg0: !tt.ptr<f32>, %base_offset: i32, %runtime_mod: i32) -> tensor<64xf32, #blocked_direct> {
+    %pid = tt.get_program_id x : i32
+    %pid_rem = arith.remsi %pid, %runtime_mod : i32
+    %pid_rem_splat = tt.splat %pid_rem : i32 -> tensor<64xi32, #blocked_direct>
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked_direct>
+    %dividend = arith.addi %pid_rem_splat, %range : tensor<64xi32, #blocked_direct>
+    %mod = tt.splat %runtime_mod : i32 -> tensor<64xi32, #blocked_direct>
+    %lane = arith.remsi %dividend, %mod : tensor<64xi32, #blocked_direct>
+    %base = tt.splat %base_offset : i32 -> tensor<64xi32, #blocked_direct>
+    %offset = arith.addi %base, %lane : tensor<64xi32, #blocked_direct>
+    // COMMON: %[[LANE:.*]] = arith.remsi {{.*}} : tensor<64xi32
+    // COMMON: amdg.buffer_load %arg0[%[[LANE]], %arg{{[0-9]+}}]
+    %loaded = amdg.buffer_load %arg0[%offset] : tensor<64xf32, #blocked_direct>
+    tt.return %loaded : tensor<64xf32, #blocked_direct>
+  }
+}
+
+// -----
+
+#blocked_direct = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [64], warpsPerCTA = [1], order = [0]}>
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 64 : i32} {
   // COMMON-LABEL: direct_buffer_load_for_iter_arg_soffset_split
   tt.func @direct_buffer_load_for_iter_arg_soffset_split(%arg0: !tt.ptr<f32>, %base_offset: i32) -> tensor<64xf32, #blocked_direct> {
     %c0 = arith.constant 0 : index
