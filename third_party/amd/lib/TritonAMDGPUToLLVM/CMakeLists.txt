@@ -4,7 +4,6 @@ add_triton_library(TritonAMDGPUToLLVM
     AllocateSharedMemory.cpp
     PrepareConSanCaptures.cpp
     BufferOpsEmitter.cpp
-    OffsetUniformitySplit.cpp
     TensorPtrOpsToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
     ConvertWarpPipeline.cpp
