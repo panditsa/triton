@@ -125,3 +125,39 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
         tt.return
     }
 }
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+    // CHECK-LABEL: @split_trunc_i64_all_nonneg
+    // CHECK: amdg.buffer_load
+    // CHECK-SAME: amdgpu.split_soffset_safe
+    tt.func @split_trunc_i64_all_nonneg(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+        %c5_i64 = arith.constant 5 : i64
+        %base64 = tt.splat %c5_i64 : i64 -> tensor<128xi64, #blocked0>
+        %base = arith.trunci %base64 : tensor<128xi64, #blocked0> to tensor<128xi32, #blocked0>
+        %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked0>
+        %offset = arith.addi %base, %range : tensor<128xi32, #blocked0>
+        %ret = amdg.buffer_load %arg0[%offset] : tensor<128xf32, #blocked0>
+        tt.return
+    }
+}
+
+// -----
+
+#blocked0 = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [1], order = [0]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+    // CHECK-LABEL: @no_split_trunc_i64_negative_leaf
+    // CHECK: amdg.buffer_load
+    // CHECK-NOT: amdgpu.split_soffset_safe
+    tt.func @no_split_trunc_i64_negative_leaf(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+        %cn5_i64 = arith.constant -5 : i64
+        %base64 = tt.splat %cn5_i64 : i64 -> tensor<128xi64, #blocked0>
+        %base = arith.trunci %base64 : tensor<128xi64, #blocked0> to tensor<128xi32, #blocked0>
+        %range = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32, #blocked0>
+        %offset = arith.addi %base, %range : tensor<128xi32, #blocked0>
+        %ret = amdg.buffer_load %arg0[%offset] : tensor<128xf32, #blocked0>
+        tt.return
+    }
+}

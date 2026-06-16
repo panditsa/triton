@@ -9,6 +9,9 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <string>
 
 namespace mlir {
 
@@ -22,6 +25,8 @@ namespace tta = mlir::triton::amdgpu;
 namespace ttg = mlir::triton::gpu;
 
 constexpr llvm::StringLiteral kSplitSafeAttrName = "amdgpu.split_soffset_safe";
+constexpr llvm::StringLiteral kSplitUnsafeAttrName =
+    "amdgpu.split_soffset_unsafe_reason";
 
 // Shape/layout ops that forward their operand's values unchanged, and with them
 // the operand's sign and its integer-range lattice state.
@@ -62,9 +67,48 @@ static bool isLeafNonNegative(Value v, DataFlowSolver &solver) {
   return succeeded(dataflow::staticallyNonNegative(solver, v));
 }
 
-static bool isNonNegative(Value v, DataFlowSolver &solver) {
-  if (!v)
+static std::string describeValueForSplitSafety(Value v, DataFlowSolver &solver) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  if (!v) {
+    os << "<null>";
+    return os.str();
+  }
+
+  Value peeled = peelTransparentWrappers(v);
+  os << "value=";
+  peeled.print(os);
+  os << " type=" << peeled.getType();
+
+  if (Operation *def = peeled.getDefiningOp())
+    os << " def=" << def->getName().getStringRef();
+  else if (auto arg = dyn_cast<BlockArgument>(peeled))
+    os << " block_arg=" << arg.getArgNumber();
+  else
+    os << " def=<none>";
+
+  const auto *range = solver.lookupState<dataflow::IntegerValueRangeLattice>(v);
+  if (!range) {
+    os << " range=<missing>";
+  } else if (range->getValue().isUninitialized()) {
+    os << " range=<uninitialized>";
+  } else if (AMD::isEmptyInitializedRange(range->getValue().getValue())) {
+    os << " range=<empty-initialized>";
+  } else {
+    const auto &bounds = range->getValue().getValue();
+    os << " range.s=[" << bounds.smin() << "," << bounds.smax() << "]";
+    os << " range.u=[" << bounds.umin() << "," << bounds.umax() << "]";
+  }
+  return os.str();
+}
+
+static bool isNonNegativeImpl(Value v, DataFlowSolver &solver,
+                              std::string *reason, unsigned depth = 0) {
+  if (!v) {
+    if (reason)
+      *reason = "null value";
     return false;
+  }
 
   // Prefer the lattice result. The structural cases below enforce the
   // stronger leaf-wise proof needed before splitting soffset from voffset.
@@ -72,8 +116,11 @@ static bool isNonNegative(Value v, DataFlowSolver &solver) {
     return true;
 
   Operation *def = v.getDefiningOp();
-  if (!def)
+  if (!def) {
+    if (reason)
+      *reason = "no defining op: " + describeValueForSplitSafety(v, solver);
     return false;
+  }
 
   // Recurse through ops where "all operands non-negative -> result
   // non-negative" (with the same < 2GB wrap caveat the rest of the
@@ -81,29 +128,60 @@ static bool isNonNegative(Value v, DataFlowSolver &solver) {
   if (isa<arith::AddIOp, arith::MulIOp, arith::OrIOp, arith::XOrIOp,
           arith::DivSIOp, arith::DivUIOp, arith::MinSIOp, arith::MinUIOp,
           arith::MaxSIOp, arith::MaxUIOp, arith::ExtSIOp>(def)) {
-    for (Value operand : def->getOperands())
-      if (!isNonNegative(operand, solver))
+    unsigned idx = 0;
+    for (Value operand : def->getOperands()) {
+      std::string childReason;
+      if (!isNonNegativeImpl(operand, solver, &childReason, depth + 1)) {
+        if (reason) {
+          std::string storage;
+          llvm::raw_string_ostream os(storage);
+          os << "op " << def->getName().getStringRef() << " operand " << idx
+             << " not non-negative; " << childReason;
+          *reason = os.str();
+        }
         return false;
+      }
+      ++idx;
+    }
     return true;
   }
 
-  // First operand only (sign carries from operand 0).
-  if (isa<arith::ShLIOp, arith::ShRSIOp, arith::RemSIOp, arith::RemUIOp>(def))
-    return isNonNegative(def->getOperand(0), solver);
+  // First operand only. For TruncIOp this relies on the same <2GB
+  // offset precondition used before i64 offsets are converted to buffer ops.
+  if (isa<arith::ShLIOp, arith::ShRSIOp, arith::RemSIOp, arith::RemUIOp,
+          arith::TruncIOp>(def))
+    return isNonNegativeImpl(def->getOperand(0), solver, reason, depth + 1);
 
   // Always non-negative regardless of operands.
   if (isa<arith::ShRUIOp, arith::ExtUIOp>(def))
     return true;
 
   // Triton shape/control ops that are non-negative or preserve sign.
-  if (auto mr = dyn_cast<triton::MakeRangeOp>(def))
-    return mr.getStartAttr().getInt() >= 0;
+  if (auto mr = dyn_cast<triton::MakeRangeOp>(def)) {
+    bool ok = mr.getStartAttr().getInt() >= 0;
+    if (!ok && reason)
+      *reason = "tt.make_range starts negative: " +
+                describeValueForSplitSafety(v, solver);
+    return ok;
+  }
   if (isa<triton::GetProgramIdOp, triton::GetNumProgramsOp>(def))
     return true;
   if (isTransparentWrapper(def))
-    return isNonNegative(def->getOperand(0), solver);
+    return isNonNegativeImpl(def->getOperand(0), solver, reason, depth + 1);
 
+  if (reason) {
+    std::string storage;
+    llvm::raw_string_ostream os(storage);
+    os << "unsupported/non-proven op " << def->getName().getStringRef() << "; "
+       << describeValueForSplitSafety(v, solver);
+    *reason = os.str();
+  }
   return false;
+}
+
+static bool isNonNegative(Value v, DataFlowSolver &solver,
+                          std::string *reason = nullptr) {
+  return isNonNegativeImpl(v, solver, reason);
 }
 
 struct AnnotateBufferOpSplitSafetyPass
@@ -126,8 +204,14 @@ struct AnnotateBufferOpSplitSafetyPass
 
     UnitAttr unit = UnitAttr::get(&getContext());
     auto annotateIfSafe = [&](Operation *op, Value offsets) {
-      if (isNonNegative(offsets, *solver))
+      std::string unsafeReason;
+      if (isNonNegative(offsets, *solver, &unsafeReason)) {
         op->setAttr(kSplitSafeAttrName, unit);
+        op->removeAttr(kSplitUnsafeAttrName);
+      } else {
+        op->setAttr(kSplitUnsafeAttrName,
+                    StringAttr::get(&getContext(), unsafeReason));
+      }
     };
 
     mod.walk([&](Operation *op) {
