@@ -9,6 +9,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
@@ -102,6 +103,55 @@ static std::string describeValueForSplitSafety(Value v, DataFlowSolver &solver) 
   return os.str();
 }
 
+// `arith.trunci` preserves non-negativity only when the source value fits in
+// the signed non-negative range of the destination. Otherwise a positive i64
+// such as 2^31 truncates to a negative i32.
+static bool isTruncINonNegative(arith::TruncIOp truncOp,
+                                 DataFlowSolver &solver,
+                                 std::string *reason) {
+  const auto *range = solver.lookupState<dataflow::IntegerValueRangeLattice>(
+      truncOp.getIn());
+  if (!range || range->getValue().isUninitialized()) {
+    if (reason)
+      *reason = "arith.trunci source range unavailable: " +
+                describeValueForSplitSafety(truncOp.getIn(), solver);
+    return false;
+  }
+  if (AMD::isEmptyInitializedRange(range->getValue().getValue())) {
+    if (reason)
+      *reason = "arith.trunci source range empty-initialized: " +
+                describeValueForSplitSafety(truncOp.getIn(), solver);
+    return false;
+  }
+
+  auto dstTy = dyn_cast<IntegerType>(getElementTypeOrSelf(truncOp.getOut()));
+  if (!dstTy) {
+    if (reason)
+      *reason = "arith.trunci result is not integer: " +
+                describeValueForSplitSafety(truncOp.getOut(), solver);
+    return false;
+  }
+
+  const auto &bounds = range->getValue().getValue();
+  if (bounds.smin().isNegative()) {
+    if (reason)
+      *reason = "arith.trunci source may be negative: " +
+                describeValueForSplitSafety(truncOp.getIn(), solver);
+    return false;
+  }
+
+  unsigned srcWidth = bounds.smax().getBitWidth();
+  llvm::APInt dstSignedMax =
+      llvm::APInt::getSignedMaxValue(dstTy.getWidth()).zextOrTrunc(srcWidth);
+  if (bounds.smax().sgt(dstSignedMax)) {
+    if (reason)
+      *reason = "arith.trunci source may exceed destination signed max: " +
+                describeValueForSplitSafety(truncOp.getIn(), solver);
+    return false;
+  }
+  return true;
+}
+
 static bool isNonNegativeImpl(Value v, DataFlowSolver &solver,
                               std::string *reason, unsigned depth = 0) {
   if (!v) {
@@ -146,10 +196,11 @@ static bool isNonNegativeImpl(Value v, DataFlowSolver &solver,
     return true;
   }
 
-  // First operand only. For TruncIOp this relies on the same <2GB
-  // offset precondition used before i64 offsets are converted to buffer ops.
-  if (isa<arith::ShLIOp, arith::ShRSIOp, arith::RemSIOp, arith::RemUIOp,
-          arith::TruncIOp>(def))
+  if (auto trunc = dyn_cast<arith::TruncIOp>(def))
+    return isTruncINonNegative(trunc, solver, reason);
+
+  // First operand only (sign carries from operand 0).
+  if (isa<arith::ShLIOp, arith::ShRSIOp, arith::RemSIOp, arith::RemUIOp>(def))
     return isNonNegativeImpl(def->getOperand(0), solver, reason, depth + 1);
 
   // Always non-negative regardless of operands.
