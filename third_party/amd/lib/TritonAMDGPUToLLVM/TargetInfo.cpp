@@ -165,13 +165,49 @@ Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
   return ROCDL::BallotOp::create(rewriter, loc, type, cmp);
 }
 
+Value TargetInfo::getGlobalTimer(RewriterBase &rewriter, Location loc) const {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  Value timer;
+  switch (getISAFamily()) {
+  case ISAFamily::RDNA3:
+  case ISAFamily::RDNA4:
+  case ISAFamily::GFX1250: {
+    Value msg = b.i32_val(/*MSG_RTN_GET_REALTIME=*/131);
+    timer = LLVM::createLLVMIntrinsicCallOp(
+                rewriter, loc, "llvm.amdgcn.s.sendmsg.rtn.i64", i64_ty, {msg})
+                .getResult(0);
+    break;
+  }
+  default:
+    timer = LLVM::createLLVMIntrinsicCallOp(
+                rewriter, loc, "llvm.amdgcn.s.memrealtime", i64_ty, {})
+                .getResult(0);
+    break;
+  }
+  // The clock generator runs at 100 MHz, so each tick is 10 ns.
+  return b.mul(timer, b.i64_val(10));
+}
+
+StringRef TargetInfo::getAtomicSyncScope(MemSyncScope scope) const {
+  switch (scope) {
+  case MemSyncScope::CTA:
+    return "workgroup";
+  case MemSyncScope::GPU:
+    return "agent";
+  case MemSyncScope::SYSTEM:
+    return {};
+  }
+  llvm_unreachable("unknown memory synchronization scope");
+}
+
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          triton::gpu::AddrSpace targets) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   b.barrier(targets);
 }
 
-void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter) const {
+void TargetInfo::clusterBarrier(Location loc, RewriterBase &rewriter,
+                                Operation * /*sourceOp*/) const {
   triton::amdgpu::ClusterBarrierArriveOp::create(rewriter, loc);
   triton::amdgpu::ClusterBarrierWaitOp::create(rewriter, loc);
 }
@@ -182,9 +218,8 @@ void TargetInfo::warpSync(Location loc, RewriterBase &rewriter) const {
 }
 
 void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Value val,
-                              Value pred) const {
-  if (ctaId.has_value()) {
+                              Value ctaId, Value val, Value pred) const {
+  if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
   }
@@ -200,9 +235,9 @@ TargetInfo::queryLDSTransLoadParams(int bitWidth) const {
 }
 
 Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                              std::optional<Value> ctaId, Type elemTy,
-                              Value pred, Operation *localLoadOp) const {
-  if (ctaId.has_value()) {
+                              Value ctaId, Type elemTy, Value pred,
+                              Operation *localLoadOp) const {
+  if (ctaId) {
     llvm::report_fatal_error(
         "AMDGPU does not support cross-CTA shared memory transfers");
   }

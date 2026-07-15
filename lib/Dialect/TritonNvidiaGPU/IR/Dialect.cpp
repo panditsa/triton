@@ -71,12 +71,11 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
   auto S = [&](StringRef str) { return StringAttr::get(ctx, str); };
   auto kRow = S("row");
   auto kCol = S("col");
-  // Remove multibuffering if present
-  auto shape = memDescType.getShape().take_back(2);
-  auto ll = toLinearLayout(shape, memDescType.getEncoding());
+  // Remove multibuffering if present and preserve any tensor-memory subview.
+  auto ll = toLinearLayout(memDescType);
   auto bitwidth = memDescType.getElementTypeBitWidth();
   int nRow = ll.getInDimSize(kRow);
-  int nCol = ll.getInDimSize(kCol) / (32 / bitwidth);
+  int nCol = llvm::divideCeil(ll.getInDimSize(kCol) * bitwidth, 32);
   // If we have just one 16xcol block per warp, we don't allocate 128 rows
   // we use 64 rows instead.
   // We could generalise this to when we have more zeros in the layout, but
@@ -92,14 +91,15 @@ TMemAllocation getTmemAllocSizes(MemDescType memDescType) {
   return {nRow, nCol};
 }
 
-uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t nOffset) {
+uint32_t getTMemSubSliceOffset(MemDescType memDescType, int32_t offset,
+                               int32_t dim) {
   auto llInv = toLinearLayout(memDescType).pseudoinvert();
   auto dimNames = llvm::to_vector(llInv.getInDimNames());
   SmallVector<std::pair<StringAttr, int32_t>> logicalOffsets;
   logicalOffsets.reserve(dimNames.size());
   for (auto dim : dimNames)
     logicalOffsets.push_back({dim, 0});
-  logicalOffsets.back().second = nOffset;
+  logicalOffsets[dim].second = offset;
 
   auto rowCol = llInv.apply(logicalOffsets);
   uint32_t bitwidth = memDescType.getElementTypeBitWidth();
@@ -206,7 +206,9 @@ getDistributedLayoutForTmemLdSt(const LinearLayout &ll, TMemAccessAtom atom,
       // Software padding with just one column
       return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, 32);
     } else {
-      assert(false && "Should not happen");
+      // This can fail for fp4_padded layouts as we don't support implicit
+      // padding and unpadding upon load yet.
+      return std::nullopt;
     }
   }
   // getTileLayout returns the layout for a bitwidth of 32
@@ -319,7 +321,7 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
          "numWarps must be a power of 2 and >= 4");
   assert(atom != TMemAccessAtom::I16x32bx2 &&
          "This layout is inferred sometimes for the 32x32b atom");
-  auto ll = toLinearLayout(memType.getShape(), memType.getEncoding());
+  auto ll = toLinearLayout(memType);
   auto bitwidth = memType.getElementTypeBitWidth();
   return getDistributedLayoutForTmemLdSt(ll, atom, numWarps, bitwidth);
 }
@@ -327,15 +329,6 @@ getDistributedLayoutForTmemLdSt(gpu::MemDescType memType, TMemAccessAtom atom,
 DistributedEncodingTrait getDefaultLayoutForTmemLdSt(gpu::MemDescType memType,
                                                      unsigned numWarps) {
   auto *ctx = memType.getContext();
-  bool prefer16x256 =
-      triton::tools::getBoolEnv("TRITON_PREFER_TMEM_16x256_LAYOUT");
-  if (prefer16x256) {
-    auto layout = getDistributedLayoutForTmemLdSt(
-        memType, TMemAccessAtom::I16x256b, numWarps);
-    if (layout) {
-      return LinearEncodingAttr::get(ctx, std::move(*layout));
-    }
-  }
   auto layout = getDistributedLayoutForTmemLdSt(
       memType, TMemAccessAtom::I32x32b, numWarps);
   assert(layout);
@@ -415,11 +408,10 @@ bool isDistributedLayoutTMemCompatible(Operation *op,
   return succeeded(computeTMemLdStEncodingInfo(tensorType, memType, maxnreg));
 }
 
-LogicalResult
-TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
-                                 unsigned blockM, unsigned blockN,
-                                 unsigned colStride,
-                                 gpu::CGAEncodingAttr cgaLayout, bool twoCTAs) {
+LogicalResult TensorMemoryEncodingAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, unsigned blockM,
+    unsigned blockN, unsigned colStride, gpu::CGAEncodingAttr cgaLayout,
+    bool twoCTAs, bool fp4Padded) {
   if (cgaLayout.getRank() != 2) {
     return emitError() << "CGALayout must have rank 2";
   }
@@ -445,6 +437,11 @@ TensorMemoryEncodingAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   if (!(colStride == 1 || colStride == 2 || colStride == 4)) {
     return emitError() << "colStride must be 1, 2, or 4 but got "
                        << "but got " << colStride;
+  }
+  if (fp4Padded && colStride != 1) {
+    return emitError() << "fp4Padded tensor memory layout requires colStride "
+                          "1 but got "
+                       << colStride;
   }
   return success();
 }

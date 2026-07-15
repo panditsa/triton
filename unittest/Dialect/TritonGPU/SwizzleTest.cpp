@@ -65,21 +65,21 @@ protected:
     if (cOrder.empty())
       cOrderStorage.assign(order.begin(), order.end());
 
-    auto cta = mlir::triton::gpu::CGAEncodingAttr::fromSplitParams(
+    auto cgaLayout = mlir::triton::gpu::CGAEncodingAttr::fromSplitParams(
         &ctx, cpgStorage.empty() ? cpg : ArrayRef<unsigned>(cpgStorage),
         splitStorage.empty() ? split : ArrayRef<unsigned>(splitStorage),
         cOrderStorage.empty() ? cOrder : ArrayRef<unsigned>(cOrderStorage));
     return mlir::triton::gpu::BlockedEncodingAttr::get(&ctx, spt, tpw, wpcta,
-                                                       order, cta);
+                                                       order, cgaLayout);
   }
 
   mlir::triton::gpu::NvidiaMmaEncodingAttr mma(ArrayRef<unsigned> version,
                                                ArrayRef<unsigned> warpsPerCTA,
                                                ArrayRef<unsigned> instrShape) {
-    auto cta = mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(
+    auto cgaLayout = mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(
         &ctx, warpsPerCTA.size());
     return mlir::triton::gpu::NvidiaMmaEncodingAttr::get(
-        &ctx, version[0], version[1], warpsPerCTA, cta, instrShape);
+        &ctx, version[0], version[1], warpsPerCTA, cgaLayout, instrShape);
   }
 
   mlir::triton::gpu::NVMMASharedEncodingAttr
@@ -87,31 +87,31 @@ protected:
               bool transposed = false) {
     SmallVector<unsigned> cpg(rank, 1), split(rank, 1), order(rank);
     std::iota(order.begin(), order.end(), 0);
-    auto cta = mlir::triton::gpu::CGAEncodingAttr::fromSplitParams(
+    auto cgaLayout = mlir::triton::gpu::CGAEncodingAttr::fromSplitParams(
         &ctx, cpg, split, order);
     return mlir::triton::gpu::NVMMASharedEncodingAttr::get(
         &ctx, swizzle, transposed, bitwidth,
-        /*fp4Padded=*/false, cta);
+        /*fp4Padded=*/false, cgaLayout);
   }
 
   mlir::triton::gpu::AMDMfmaEncodingAttr
   mfma(unsigned version, ArrayRef<unsigned> warpsPerCTA,
        ArrayRef<unsigned> instrShape, bool isTransposed,
        ArrayRef<unsigned> tilesPerWarp = {}, unsigned bitWidth = 0) {
-    auto cta = mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(
+    auto cgaLayout = mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(
         &ctx, warpsPerCTA.size());
     return mlir::triton::gpu::AMDMfmaEncodingAttr::get(
-        &ctx, version, warpsPerCTA, instrShape, isTransposed, cta, tilesPerWarp,
-        bitWidth);
+        &ctx, version, warpsPerCTA, instrShape, isTransposed, cgaLayout,
+        tilesPerWarp, bitWidth);
   }
 
   mlir::triton::gpu::AMDRotatingSharedEncodingAttr
   AMDRotatingShared(unsigned vec, unsigned perPhase, unsigned maxPhase,
                     ArrayRef<unsigned> order) {
-    auto cta =
+    auto cgaLayout =
         mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(&ctx, order.size());
     return mlir::triton::gpu::AMDRotatingSharedEncodingAttr::get(
-        &ctx, vec, perPhase, maxPhase, order, cta);
+        &ctx, vec, perPhase, maxPhase, order, cgaLayout);
   }
 
   LinearLayout toLL(ArrayRef<int64_t> shape, Attribute attr) {
@@ -343,6 +343,36 @@ TEST_F(SwizzleTest, Test16x16Bf16BlockedMma) {
   auto [r, w] = bankConflictsLdSt(blocked, mma, smem, /*bitwidth=*/16);
   EXPECT_EQ(r, 0);
   EXPECT_EQ(w, 0);
+}
+
+TEST_F(BankConflictTest, F64MmaV2BSharedLayout) {
+  using mlir::triton::gpu::DotOperandEncodingAttr;
+  using mlir::triton::gpu::SwizzledSharedEncodingAttr;
+
+  SmallVector<int64_t> shape = {4, 16};
+  auto src = blocked(/*spt=*/{1, 1}, /*tpw=*/{2, 16}, /*wpcta=*/{4, 1},
+                     /*order=*/{1, 0});
+  auto mmaV2 = mma({2, 0}, {4, 1}, {8, 8});
+  auto dst = DotOperandEncodingAttr::get(&ctx, /*opIdx=*/1, mmaV2,
+                                         /*kWidth=*/1);
+  auto cgaLayout = mlir::triton::gpu::CGAEncodingAttr::get1CTALayout(&ctx, 2);
+  auto shared = SwizzledSharedEncodingAttr::get(
+      &ctx, dst, shape, /*order=*/{1, 0}, cgaLayout, /*typeWidthInBit=*/64);
+  EXPECT_EQ(shared.getVec(), 4);
+  EXPECT_EQ(shared.getPerPhase(), 1);
+  EXPECT_EQ(shared.getMaxPhase(), 4);
+  EXPECT_EQ(computeConflicts(shape, src, shared, /*bitwidth=*/64), 0);
+  EXPECT_EQ(computeConflicts(shape, dst, shared, /*bitwidth=*/64), 0);
+
+  auto srcLL =
+      actionRemoveBroadcastedRegs(toLL(shape, src)).apply(toLL(shape, src));
+  auto dstLL =
+      actionRemoveBroadcastedRegs(toLL(shape, dst)).apply(toLL(shape, dst));
+  auto optimal = optimalSwizzlingLdSt(srcLL, dstLL, /*bitwidth=*/64);
+  auto [readConflicts, writeConflicts] =
+      bankConflictsLdSt(srcLL, dstLL, optimal, /*bitwidth=*/64);
+  EXPECT_EQ(readConflicts, 0);
+  EXPECT_EQ(writeConflicts, 0);
 }
 
 TEST_F(SwizzleTest, Test16x256U4Mma) {
