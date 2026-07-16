@@ -297,76 +297,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
   // redundant barriers by deferring the barrier to the later sync point.
   if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
       !hasSyncPointBeforeMemoryEffect(op)) {
-    // The barrier after an async wait exists to make async-copied shared memory
-    // visible CTA-wide before it is read. If the backend-provided `filter`
-    // proves every pending shared-memory write we are waiting on is already
-    // synchronized with the downstream consumers (e.g. on AMD, an async copy
-    // paired with a LocalLoad marked syncedViaAsyncWait on the same buffer),
-    // then the per-lane async wait (s_waitcnt) already suffices and the CTA
-    // barrier is redundant. Skipping it lets loads interleave with compute
-    // instead of being walled off by a full-drain barrier.
-    bool barrierIsRedundant = false;
-    if (filter) {
-      // Collect the shared-memory READ consumers gated by this wait: the
-      // LocalLoad ops that follow until the next sync point. Only reads can
-      // form a RAW hazard against the pending async-copy writes; other
-      // memory-effecting ops (further async copies, VGPR buffer loads) have
-      // their own hazard handling and must not veto this decision.
-      SmallVector<Operation *> downstreamConsumers;
-      for (Operation *next = op->getNextNode(); next;
-           next = next->getNextNode()) {
-        if (containsLocalBarrier(next) ||
-            next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
-          break;
-        if (isa<RegionBranchOpInterface>(next))
-          break;
-        if (isa<triton::gpu::LocalLoadOp>(next))
-          downstreamConsumers.push_back(next);
-      }
-      // Build this wait's read set (the local loads it gates) keyed by
-      // AllocationSlice, mirroring how the main hazard path tracks reads, so we
-      // can reuse BlockInfo::isIntersected. That routine only considers
-      // pending-write / read pairs whose slices actually intersect, and applies
-      // the backend `filter` to each such pair. If every real (buffer-
-      // overlapping) write->read hazard is filtered (AMD: async copy paired
-      // with a syncedViaAsyncWait LocalLoad on the same buffer), the CTA
-      // barrier is redundant and the per-lane async wait already suffices.
-      BlockInfo waitReadInfo;
-      bool anyConsumerSlice = false;
-      for (Operation *consumer : downstreamConsumers) {
-        if (auto memEff = dyn_cast<MemoryEffectOpInterface>(consumer)) {
-          SmallVector<SideEffects::EffectInstance<MemoryEffects::Effect>> effs;
-          memEff.getEffects(effs);
-          for (auto &e : effs) {
-            if (!isa<MemoryEffects::Read>(e.getEffect()))
-              continue;
-            if (auto value = e.getValue()) {
-              for (auto bufferId :
-                   allocation->getAllBufferIdsWithAliases(value)) {
-                if (bufferId != Allocation::InvalidBufferId) {
-                  auto interval = allocation->getAllocatedInterval(bufferId);
-                  waitReadInfo
-                      .syncReadSlices[AllocationSlice(value, interval,
-                                                      bufferId)]
-                      .insert(consumer);
-                  anyConsumerSlice = true;
-                }
-              }
-            }
-          }
-        }
-      }
-      bool anyPendingWrite = !blockInfo->syncWriteSlices.empty();
-      // isIntersected returns true if any unfiltered real hazard exists.
-      bool hasUnfilteredHazard =
-          blockInfo->isIntersected(waitReadInfo, filter, allocation);
-      barrierIsRedundant =
-          anyPendingWrite && anyConsumerSlice && !hasUnfilteredHazard;
-    }
-    if (!barrierIsRedundant) {
-      builder->setInsertionPointAfter(op);
-      insertBarrier(op, builder);
-    }
+    builder->setInsertionPointAfter(op);
+    insertBarrier(op, builder);
     blockInfo->sync();
     return;
   }
