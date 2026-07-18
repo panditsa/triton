@@ -83,6 +83,17 @@ template <> bool setLLVMOption<bool>(const std::string &name, bool value) {
   return original;
 }
 
+// Set a boolean LLVM option encoded as either "name" or "name=true/false".
+// Backend flag lists historically only enabled options; accepting an explicit
+// value also lets a compilation opt out of LLVM defaults without mutating
+// process-global command-line state out of band.
+static void setLLVMBooleanFlag(const std::string &flag) {
+  StringRef flagRef(flag);
+  auto [name, value] = flagRef.split('=');
+  bool enabled = value.empty() || !value.equals_insensitive("false");
+  setLLVMOption<bool>(name.str(), enabled);
+}
+
 template <>
 std::string setLLVMOption<std::string>(const std::string &name,
                                        std::string value) {
@@ -170,7 +181,7 @@ void dumpSchedulingDAG(llvm::Module &module, const std::string &triple,
 
   // Apply flags
   for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
+    setLLVMBooleanFlag(flag);
   }
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
@@ -262,7 +273,7 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
 
   // Apply flags
   for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
+    setLLVMBooleanFlag(flag);
   }
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
@@ -341,7 +352,7 @@ std::string translateLLVMIRToASM(
 
   // Apply flags
   for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
+    setLLVMBooleanFlag(flag);
   }
 
   if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
@@ -447,7 +458,7 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
 
   // Apply other flags
   for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
+    setLLVMBooleanFlag(flag);
   }
 
   // Parse MIR into LLVM Module

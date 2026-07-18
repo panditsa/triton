@@ -97,6 +97,7 @@ class HIPOptions:
     kpack: int = 1
     allow_flush_denorm: bool = False
     max_num_imprecise_acc_default: int = 0
+    use_agpr_mfma: bool = False
     backend_name: str = 'hip'
     instrumentation_mode: str = ""
 
@@ -334,6 +335,11 @@ class HIPBackend(BaseBackend):
         passes.common.add_sccp(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.gluon.add_canonicalizer(pm)
+        # Match the regular TTIR -> TTGIR pipeline: recognize an MFMA-to-
+        # blocked store epilogue and select AMD's permlane-swap store layout.
+        # Gluon kernels already carry their final MFMA encodings, so this pass
+        # can run immediately after auto encodings have been resolved.
+        amd.passes.ttgpuir.add_optimize_epilogue(pm)
         passes.ttir.add_loop_unroll(pm)
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         amd.passes.ttgpuir.add_warp_pipeline(pm)
@@ -543,6 +549,11 @@ class HIPBackend(BaseBackend):
         metadata["name"] = names[0]
         # llvm -> hsaco
         flags = []
+        if options.use_agpr_mfma:
+            # LLVM defaults gfx90a+ MFMA instructions to the VGPR form.  The
+            # AGPR form keeps long-lived matrix accumulators out of the
+            # general operand register bank and avoids explicit bank traffic.
+            flags.append("amdgpu-mfma-vgpr-form=false")
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
         features = disable_real_true16_feature(options.arch)

@@ -1065,10 +1065,9 @@ void init_gluon_ir(py::module_ &m) {
            [](GluonOpBuilder &self, Type resultType, Value ptr, Value offsets,
               Value mask, Value other, Value validBytes,
               tt::CacheModifier cache) -> Value {
-             return self.create<ttag::BufferLoadOp>(resultType, ptr, offsets,
-                                                    Value() /*stride*/,
-                                                    validBytes, cache, mask,
-                                                    other);
+             return self.create<ttag::BufferLoadOp>(
+                 resultType, ptr, offsets, Value() /*stride*/, validBytes,
+                 cache, mask, other);
            })
       .def("create_buffer_store",
            [](GluonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
@@ -1088,9 +1087,9 @@ void init_gluon_ir(py::module_ &m) {
            [](GluonOpBuilder &self, Value dest, Value ptr, Value offsets,
               Value mask, Value other, Value stride, Value validBytes,
               tt::CacheModifier cacheModifier) {
-             self.create<ttag::BufferLoadToLocalOp>(
-                 dest, ptr, offsets, mask, other, stride, validBytes,
-                 cacheModifier);
+             self.create<ttag::BufferLoadToLocalOp>(dest, ptr, offsets, mask,
+                                                    other, stride, validBytes,
+                                                    cacheModifier);
            })
       .def("create_scaled_upcast_fp4",
            [](GluonOpBuilder &self, Value input, Value scale, Type elemType,
@@ -1212,6 +1211,10 @@ void init_gluon_ir(py::module_ &m) {
       .def("create_amd_cluster_wait",
            [](GluonOpBuilder &self) {
              self.create<ttag::ClusterBarrierWaitOp>();
+           })
+      .def("create_sched_barrier",
+           [](GluonOpBuilder &self) {
+             self.create<ROCDL::SchedBarrier>(ROCDL::SchedGroupMask::none);
            })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {
